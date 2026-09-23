@@ -1,0 +1,22 @@
+profile: cover.out
+threshold:
+  file: 70
+  package: 70
+  total: 55
+exclude:
+  paths:
+    - ^cmd/status-list-service/main\.go$ # entry point — not unit-testable
+    - ^internal/store/                    # Postgres/Redis clients — need live infra, not yet covered
+    - ^internal/api/                      # HTTP handlers wire the above together — same reason
+    - ^internal/publisher/                # orchestrates store + signing — same reason
+    - ^internal/config/                   # thin env-var loader, low value to unit test in isolation
+override:
+  # internal/pool's pure selection logic (ChooseByPowerOfTwo) is fully
+  # tested; Manager's methods (EnsureHealthy, PickForAllocation, Run,
+  # createList) need live Postgres/Redis like the excluded packages above,
+  # and share a file with the tested logic, so both the package and its
+  # one file get a reduced threshold instead of a blanket exclude.
+  - threshold: 15
+    path: ^internal/pool$
+  - threshold: 15
+    path: ^internal/pool/pool\.go$

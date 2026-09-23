@@ -1,0 +1,34 @@
+on: [push, pull_request]
+name: Test
+permissions: write-all
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: actions/setup-go@v6
+      with:
+         go-version-file: go.mod
+    - name: run tests
+      run: make test
+    - name: generate test coverage
+      run: go test ./... -coverprofile=./cover.out -covermode=atomic -coverpkg=./...
+    - name: check test coverage
+      uses: vladopajic/go-test-coverage@v2
+      with:
+        debug: true
+        config: ./.testcoverage.yml
+        git-token: ${{ github.ref_name == 'main' && secrets.GITHUB_TOKEN || '' }}
+        git-branch: badges
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: actions/setup-go@v6
+      with:
+         go-version-file: go.mod
+    - name: golangci-lint
+      uses: golangci/golangci-lint-action@v9
+      with:
+        version: v2.12.2
