@@ -16,6 +16,7 @@ import (
 
 	"github.com/sirosfoundation/siros-status-service/internal/api"
 	"github.com/sirosfoundation/siros-status-service/internal/config"
+	"github.com/sirosfoundation/siros-status-service/internal/gc"
 	"github.com/sirosfoundation/siros-status-service/internal/pool"
 	"github.com/sirosfoundation/siros-status-service/internal/publisher"
 	"github.com/sirosfoundation/siros-status-service/internal/store"
@@ -58,10 +59,12 @@ func run() error {
 
 	pub := publisher.New(bitmaps, meta, cfg.SigningKey, cfg.SigningKeyID, cfg.BaseURL)
 	pm := pool.NewManager(meta, bitmaps, cfg.PoolWidth, cfg.ListCapacity, cfg.ListBits, cfg.RotationMaxAge)
+	sweeper := gc.NewSweeper(meta, bitmaps, cfg.GCGracePeriod, cfg.GCRetentionPeriod)
 
 	srv := api.New(cfg, meta, bitmaps, pub, pm)
 	go pub.Run(ctx, cfg.PublishInterval, srv.ListsForPublishing)
 	go pm.Run(ctx, cfg.PoolCheckInterval)
+	go sweeper.Run(ctx, cfg.GCCheckInterval)
 
 	httpSrv := &http.Server{Addr: cfg.HTTPAddr, Handler: srv.Router()}
 	go func() {

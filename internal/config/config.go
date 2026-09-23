@@ -64,6 +64,20 @@ type Config struct {
 	// see internal/publisher's package doc).
 	PublishInterval time.Duration
 
+	// GCGracePeriod is the buffer past a list's max_exp before internal/gc
+	// archives it (docs/design.md §7 point 4's grace_period) — absorbs
+	// clock skew and the last few genuinely-still-checking verifiers
+	// rather than archiving the instant the nominal expiry passes.
+	GCGracePeriod time.Duration
+	// GCRetentionPeriod is how long an archived list stays servable
+	// (last-published token, no further writes) before internal/api
+	// starts returning 410 and internal/gc drops its Redis bitmap
+	// (docs/design.md §7 point 4 / §13's decided dead-link policy).
+	GCRetentionPeriod time.Duration
+	// GCCheckInterval is how often internal/gc sweeps for lists to
+	// archive or purge — infrequent by design (§12), like PoolCheckInterval.
+	GCCheckInterval time.Duration
+
 	// SigningKey signs StatusListTokens; SigningKeyID is placed in the
 	// JWS `kid` header.
 	SigningKey   *ecdsa.PrivateKey
@@ -95,6 +109,9 @@ func FromEnv() (*Config, error) {
 		PoolWidth:         4,
 		RotationMaxAge:    24 * time.Hour,
 		PoolCheckInterval: 30 * time.Second,
+		GCGracePeriod:     24 * time.Hour,
+		GCRetentionPeriod: 30 * 24 * time.Hour,
+		GCCheckInterval:   time.Hour,
 	}
 
 	if v := os.Getenv("LIST_CAPACITY"); v != "" {
@@ -145,6 +162,30 @@ func FromEnv() (*Config, error) {
 			return nil, fmt.Errorf("config: POOL_CHECK_INTERVAL: %w", err)
 		}
 		c.PoolCheckInterval = d
+	}
+
+	if v := os.Getenv("GC_GRACE_PERIOD"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("config: GC_GRACE_PERIOD: %w", err)
+		}
+		c.GCGracePeriod = d
+	}
+
+	if v := os.Getenv("GC_RETENTION_PERIOD"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("config: GC_RETENTION_PERIOD: %w", err)
+		}
+		c.GCRetentionPeriod = d
+	}
+
+	if v := os.Getenv("GC_CHECK_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("config: GC_CHECK_INTERVAL: %w", err)
+		}
+		c.GCCheckInterval = d
 	}
 
 	keyPEM := os.Getenv("SIGNING_KEY_PEM")

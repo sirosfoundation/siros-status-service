@@ -141,3 +141,16 @@ func (s *BitmapStore) Version(ctx context.Context, listID string) (int64, error)
 	}
 	return v, nil
 }
+
+// Purge drops a list's bitmap and version keys from Redis — the "drop
+// the bitmap from hot storage" step of GC (docs/design.md §7 point 4),
+// once a list is archived and past its retention window. Deleting a
+// key that's already gone is a no-op in Redis, so this is safe to call
+// more than once, though internal/gc tracks a purged flag in Postgres
+// to avoid doing so needlessly.
+func (s *BitmapStore) Purge(ctx context.Context, listID string) error {
+	if err := s.rdb.Del(ctx, bitmapKey(listID), versionKey(listID)).Err(); err != nil {
+		return fmt.Errorf("store: purge list %s: %w", listID, err)
+	}
+	return nil
+}

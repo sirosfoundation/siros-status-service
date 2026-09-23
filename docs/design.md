@@ -442,7 +442,8 @@ To validate the core claims cheaply before building the full service:
 4. Skip list rotation/GC (§7), the pool-based distribution algorithm and
    expiry bucketing (§8), for the first pass — confirm the allocator and
    publisher work end-to-end on a single ACTIVE list before adding
-   lifecycle/pool management.
+   lifecycle/pool management. (Rotation done in item 7 below; GC done in
+   item 8.)
 5. Ship it as a single Fly app (Phase 1 of §12) — this is enough to
    demonstrate the API contract and the caching behavior to the team without
    committing to any sharding infrastructure up front.
@@ -461,3 +462,20 @@ To validate the core claims cheaply before building the full service:
    fill-triggered freeze, and pool top-up all observed firing correctly).
    Expiry bucketing (§8.3) and the target-based rotation knob (§8.2) remain
    deferred — see the repo's README "Known gaps."
+8. **Done (2026-09-23).** The GC/archival sweeper (§7 point 4): a
+   background job (`internal/gc`) transitions FROZEN lists to ARCHIVED
+   once `now > max_exp + grace_period`, then drops a list's Redis bitmap
+   once `now > archived_at + retention_period` — matching the decided
+   410-after-retention policy from §13. Archived lists reject further
+   status updates (there's nothing left to revoke once every credential
+   has expired) but keep serving their last-published token for the
+   full retention window, so a late verifier never sees a sudden dead
+   link. Validated live: allocated an already-expired credential into a
+   capacity-1 list (auto-freezing it immediately), watched it archive on
+   the next GC tick, confirmed it still served `200` mid-retention-window
+   and rejected a revoke attempt with `410`, then confirmed the bitmap
+   was purged and the list itself started returning `410` once the
+   window passed. Deferred: actually deleting the Postgres row itself
+   (only the Redis bitmap is dropped; the row stays so 410 semantics and
+   audit history remain available indefinitely) — revisit only if that
+   metadata's own storage cost becomes worth reclaiming.

@@ -10,6 +10,7 @@ exclude:
     - ^internal/api/                      # HTTP handlers wire the above together — same reason
     - ^internal/publisher/                # orchestrates store + signing — same reason
     - ^internal/config/                   # thin env-var loader, low value to unit test in isolation
+    - ^internal/gc/                       # archive/purge sweep — needs live Postgres/Redis, same reason
 override:
   # internal/pool's pure selection logic (ChooseByPowerOfTwo) is fully
   # tested; Manager's methods (EnsureHealthy, PickForAllocation, Run,

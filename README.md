@@ -8,10 +8,11 @@ design and rationale.
 **Status:** prototype (docs/design.md §14). This validates the core
 claims end to end: the keyed FPE index allocator, spec-conformant
 bit-packing, the allocate/update/publish/cache loop, real rotation on
-both fullness (N_max) and age (T_max), and the §8.1 issuer-blind,
+both fullness (N_max) and age (T_max), the §8.1 issuer-blind,
 power-of-two-choices distribution pool across K concurrently-ACTIVE
-lists. GC/archival and the finer §8.2/§8.3 controls are deliberately not
-yet implemented; see "Known gaps" below.
+lists, and the §7 point 4 GC/archival sweeper (archive on expiry +
+grace, purge on retention, 410 after that). The finer §8.2/§8.3 controls
+are deliberately not yet implemented; see "Known gaps" below.
 
 ## Architecture
 
@@ -43,6 +44,13 @@ yet implemented; see "Known gaps" below.
   and the verifier-facing `GET /lists/{id}` (with ETag/conditional-GET
   support). `POST /allocate` retries against a freshly-queried pool if
   the list it picked got filled or frozen by a concurrent request first.
+  `PATCH /status` rejects writes to an ARCHIVED list; `GET` keeps serving
+  an ARCHIVED list's last-published token through its retention window,
+  then returns `410`.
+- `internal/gc` — the archive/purge sweep (§7 point 4): FROZEN lists past
+  `max_exp + GCGracePeriod` become ARCHIVED; ARCHIVED lists past
+  `archived_at + GCRetentionPeriod` have their Redis bitmap dropped. A
+  separate background loop, like `internal/pool`'s rotation maintenance.
 
 ## Live test deployment
 
@@ -103,6 +111,9 @@ curl localhost:8080/lists/<id>   # the signed StatusListToken (JWT)
 | `POOL_WIDTH` | `4` | K, per §8.1/§8.2 — concurrently-ACTIVE lists |
 | `ROTATION_MAX_AGE` | `24h` | T_max, per §8.2 — 0 disables age-based rotation |
 | `POOL_CHECK_INTERVAL` | `30s` | how often `internal/pool` checks for stale/missing lists |
+| `GC_GRACE_PERIOD` | `24h` | buffer past a list's `max_exp` before archiving, per §7 point 4 |
+| `GC_RETENTION_PERIOD` | `720h` (30d) | how long an archived list stays servable before `410`/purge |
+| `GC_CHECK_INTERVAL` | `1h` | how often `internal/gc` sweeps for lists to archive/purge |
 | `DEFAULT_TTL_SECONDS` | `3600` | see "Known gaps" re: per-issuer ttl |
 | `SIGNING_KEY_PEM` | *(required)* | PEM-encoded EC (P-256) private key |
 | `SIGNING_KEY_ID` | `prototype-1` | JWS `kid` header |
@@ -112,10 +123,11 @@ curl localhost:8080/lists/<id>   # the signed StatusListToken (JWT)
 
 These are intentionally deferred, not oversights:
 
-- **GC/archival**: nothing ever transitions to `ARCHIVED` yet, so the
-  `410 Gone` path in `handleGetList` is unexercised in practice (the
-  logic is there for when a sweeper starts setting that state). A FROZEN
-  list is published forever today rather than eventually being cleaned up.
+- **GC row cleanup**: `internal/gc` drops a list's Redis bitmap once past
+  retention, but its Postgres row (metadata + ownership records) is kept
+  indefinitely — needed to keep serving `410` correctly and for audit
+  history. Revisit only if that metadata's own storage becomes worth
+  reclaiming.
 - **Expiry-bucketed pools (§8.3)**: not implemented — a single pool
   mixes credentials of any expiration horizon, so a long-lived outlier
   can drag out a list's effective anonymity-set decay the way §8.3

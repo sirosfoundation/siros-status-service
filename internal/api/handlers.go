@@ -127,6 +127,14 @@ func (s *Server) handleSetStatus(c *gin.Context) {
 		c.JSON(404, gin.H{"error": "list not found"})
 		return
 	}
+	if lm.State == "ARCHIVED" {
+		// GC (§7 point 4) only archives once every credential in the
+		// list has expired, so there's never a legitimate revocation
+		// left to make here — reject rather than silently accepting a
+		// write that can no longer affect anything a verifier would see.
+		c.JSON(410, gin.H{"error": "this status list has been archived; no further updates are possible"})
+		return
+	}
 
 	byteIndex, bitOffset := statuslist.ByteOffset(idx, lm.Bits)
 	if _, err := s.bitmaps.SetStatus(ctx, listID, byteIndex, bitOffset, lm.Bits, byte(status)); err != nil {
@@ -153,12 +161,18 @@ func (s *Server) handleGetList(c *gin.Context) {
 		return
 	}
 	if lm.State == "ARCHIVED" {
-		// docs/design.md §7/§13: 410 Gone once the retention window
-		// past archival has elapsed. The prototype has no GC sweeper
-		// yet (§14 item 4), so ARCHIVED never actually gets set today —
-		// this branch documents the decided behavior for when it does.
-		c.JSON(410, gin.H{"error": "this status list has been archived"})
-		return
+		// docs/design.md §7/§13: keep serving the last-published token
+		// for a retention window after archival (so a verifier that
+		// checks late doesn't hit a dead link out of nowhere), then 410
+		// Gone once that window has elapsed. Within the window this
+		// falls through to the same publish path below — harmless,
+		// since an archived list accepts no further writes (see
+		// handleSetStatus), so PublishIfStale is just a cache hit after
+		// its first rebuild.
+		if lm.ArchivedAt == nil || time.Since(*lm.ArchivedAt) > s.cfg.GCRetentionPeriod {
+			c.JSON(410, gin.H{"error": "this status list has been archived"})
+			return
+		}
 	}
 
 	pub, err := s.pub.PublishIfStale(ctx, lm, s.cfg.DefaultTTLSeconds)

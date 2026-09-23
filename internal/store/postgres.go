@@ -24,15 +24,23 @@ var ErrNotOwner = errors.New("store: caller does not own this index")
 
 const schema = `
 CREATE TABLE IF NOT EXISTS lists (
-	id         text PRIMARY KEY,
-	bits       integer NOT NULL,
-	size       bigint NOT NULL,
-	cursor     bigint NOT NULL DEFAULT 0,
-	fpe_key    bytea NOT NULL,
-	max_exp    timestamptz,
-	state      text NOT NULL DEFAULT 'ACTIVE',
-	created_at timestamptz NOT NULL DEFAULT now()
+	id          text PRIMARY KEY,
+	bits        integer NOT NULL,
+	size        bigint NOT NULL,
+	cursor      bigint NOT NULL DEFAULT 0,
+	fpe_key     bytea NOT NULL,
+	max_exp     timestamptz,
+	state       text NOT NULL DEFAULT 'ACTIVE',
+	created_at  timestamptz NOT NULL DEFAULT now(),
+	archived_at timestamptz,
+	purged      boolean NOT NULL DEFAULT false
 );
+
+-- Idempotent migrations for tables created before these columns existed
+-- (e.g. the live Fly test instance) — CREATE TABLE IF NOT EXISTS above is
+-- a no-op against an existing table, so new columns need adding here too.
+ALTER TABLE lists ADD COLUMN IF NOT EXISTS archived_at timestamptz;
+ALTER TABLE lists ADD COLUMN IF NOT EXISTS purged boolean NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS allocations (
 	list_id    text NOT NULL REFERENCES lists(id),
@@ -48,14 +56,15 @@ CREATE TABLE IF NOT EXISTS allocations (
 // (minus `version`, which lives only in Redis — it is cache-control
 // state, not durable structure).
 type ListMeta struct {
-	ID        string
-	Bits      int
-	Size      uint64
-	Cursor    uint64
-	FPEKey    []byte
-	MaxExp    *time.Time
-	State     string
-	CreatedAt time.Time
+	ID         string
+	Bits       int
+	Size       uint64
+	Cursor     uint64
+	FPEKey     []byte
+	MaxExp     *time.Time
+	State      string
+	CreatedAt  time.Time
+	ArchivedAt *time.Time
 }
 
 // Remaining returns how many unallocated slots this list has left.
@@ -101,12 +110,12 @@ func (m *MetaStore) CreateList(ctx context.Context, id string, bits int, size ui
 	return &ListMeta{ID: id, Bits: bits, Size: size, FPEKey: fpeKey, State: "ACTIVE"}, nil
 }
 
-const listColumns = `id, bits, size, cursor, fpe_key, max_exp, state, created_at`
+const listColumns = `id, bits, size, cursor, fpe_key, max_exp, state, created_at, archived_at`
 
 func scanListMeta(row pgx.Row) (*ListMeta, error) {
 	var lm ListMeta
 	var size, cursor int64
-	if err := row.Scan(&lm.ID, &lm.Bits, &size, &cursor, &lm.FPEKey, &lm.MaxExp, &lm.State, &lm.CreatedAt); err != nil {
+	if err := row.Scan(&lm.ID, &lm.Bits, &size, &cursor, &lm.FPEKey, &lm.MaxExp, &lm.State, &lm.CreatedAt, &lm.ArchivedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
@@ -124,12 +133,17 @@ func (m *MetaStore) ActiveLists(ctx context.Context) ([]*ListMeta, error) {
 	return m.queryLists(ctx, `WHERE state = 'ACTIVE' ORDER BY created_at ASC`)
 }
 
-// LiveLists returns every list that still needs publishing: ACTIVE ones
-// (still accepting new allocations) and FROZEN ones (no longer accepting
-// allocations, but still accepting status updates until GC archives
-// them — §7 point 3). ARCHIVED lists are excluded; GC/archival itself is
-// not yet implemented (README "Known gaps"), so nothing produces that
-// state today.
+// LiveLists returns every list the periodic publisher should keep
+// republishing: ACTIVE ones (still accepting new allocations) and
+// FROZEN ones (no longer accepting allocations, but still accepting
+// status updates until GC archives them — §7 point 3). ARCHIVED lists
+// are excluded deliberately, not because GC doesn't exist: once
+// archived, a list accepts no further writes (internal/api enforces
+// this), so its version can never change again — there's nothing for
+// periodic republishing to do. internal/api's handleGetList still
+// serves an ARCHIVED list on direct request (via the same
+// PublishIfStale, which is a no-op cache hit after the one rebuild) for
+// as long as it's within its retention window.
 func (m *MetaStore) LiveLists(ctx context.Context) ([]*ListMeta, error) {
 	return m.queryLists(ctx, `WHERE state IN ('ACTIVE', 'FROZEN') ORDER BY created_at ASC`)
 }
@@ -173,6 +187,90 @@ func (m *MetaStore) Freeze(ctx context.Context, listID string) error {
 	_, err := m.pool.Exec(ctx, `UPDATE lists SET state = 'FROZEN' WHERE id = $1 AND state = 'ACTIVE'`, listID)
 	if err != nil {
 		return fmt.Errorf("store: freeze list %s: %w", listID, err)
+	}
+	return nil
+}
+
+// FrozenListsPastGrace returns FROZEN lists whose every credential
+// expired at least `grace` ago — i.e. `max_exp <= cutoff` where cutoff
+// is the caller's now-minus-grace (docs/design.md §7 point 4: "a
+// background sweeper scans FROZEN lists where now > max_exp +
+// grace_period"). A list with no allocations yet (max_exp IS NULL, only
+// possible if it was frozen by age-based rotation before ever being
+// used) is treated as immediately eligible — there's nothing to wait
+// out.
+func (m *MetaStore) FrozenListsPastGrace(ctx context.Context, cutoff time.Time) ([]*ListMeta, error) {
+	rows, err := m.pool.Query(ctx,
+		`SELECT `+listColumns+` FROM lists
+		  WHERE state = 'FROZEN' AND (max_exp IS NULL OR max_exp <= $1)
+		  ORDER BY created_at ASC`,
+		cutoff,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: query frozen lists past grace: %w", err)
+	}
+	defer rows.Close()
+	var out []*ListMeta
+	for rows.Next() {
+		lm, err := scanListMeta(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: scan list: %w", err)
+		}
+		out = append(out, lm)
+	}
+	return out, rows.Err()
+}
+
+// Archive transitions a FROZEN list to ARCHIVED, recording when. A
+// no-op if the list isn't FROZEN, for the same idempotency-under-races
+// reason as Freeze. Archiving stops status updates too (docs/design.md
+// §13's ownership check happens before this state is consulted, so
+// internal/api must reject writes to ARCHIVED lists itself — see
+// handleSetStatus).
+func (m *MetaStore) Archive(ctx context.Context, listID string) error {
+	_, err := m.pool.Exec(ctx,
+		`UPDATE lists SET state = 'ARCHIVED', archived_at = now() WHERE id = $1 AND state = 'FROZEN'`,
+		listID,
+	)
+	if err != nil {
+		return fmt.Errorf("store: archive list %s: %w", listID, err)
+	}
+	return nil
+}
+
+// ArchivedListsPastRetention returns ARCHIVED, not-yet-purged lists
+// whose retention window has elapsed (`archived_at <= cutoff`) — ready
+// to have their Redis bitmap dropped (docs/design.md §7 point 4 /
+// §13's decided 410 policy).
+func (m *MetaStore) ArchivedListsPastRetention(ctx context.Context, cutoff time.Time) ([]*ListMeta, error) {
+	rows, err := m.pool.Query(ctx,
+		`SELECT `+listColumns+` FROM lists
+		  WHERE state = 'ARCHIVED' AND purged = false AND archived_at <= $1
+		  ORDER BY created_at ASC`,
+		cutoff,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: query archived lists past retention: %w", err)
+	}
+	defer rows.Close()
+	var out []*ListMeta
+	for rows.Next() {
+		lm, err := scanListMeta(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: scan list: %w", err)
+		}
+		out = append(out, lm)
+	}
+	return out, rows.Err()
+}
+
+// MarkPurged records that a list's Redis bitmap has been dropped, so
+// later GC sweeps don't keep re-issuing the (harmless but wasteful)
+// delete against an already-purged key forever.
+func (m *MetaStore) MarkPurged(ctx context.Context, listID string) error {
+	_, err := m.pool.Exec(ctx, `UPDATE lists SET purged = true WHERE id = $1`, listID)
+	if err != nil {
+		return fmt.Errorf("store: mark list %s purged: %w", listID, err)
 	}
 	return nil
 }
