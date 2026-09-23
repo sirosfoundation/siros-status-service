@@ -142,6 +142,11 @@ func (s *Server) handleSetStatus(c *gin.Context) {
 		return
 	}
 
+	// docs/design.md §9: publish immediately if idle, or coalesce into
+	// the debounce window if not — see internal/publisher's package doc.
+	// Scheduling only; does not block this response on a rebuild+sign.
+	s.pub.MarkDirty(listID, s.cfg.DefaultTTLSeconds)
+
 	c.Status(204)
 }
 

@@ -8,7 +8,9 @@ exclude:
     - ^cmd/status-list-service/main\.go$ # entry point — not unit-testable
     - ^internal/store/                    # Postgres/Redis clients — need live infra, not yet covered
     - ^internal/api/                      # HTTP handlers wire the above together — same reason
-    - ^internal/publisher/                # orchestrates store + signing — same reason
+    - ^internal/publisher/publisher\.go$   # orchestrates store + signing — needs live infra, same reason.
+                                           # debounce.go (the leadingDebouncer coalescing logic, §9) is
+                                           # pure and fully unit-tested, so it's NOT excluded here.
     - ^internal/config/                   # thin env-var loader, low value to unit test in isolation
     - ^internal/gc/                       # archive/purge sweep — needs live Postgres/Redis, same reason
 override:

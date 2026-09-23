@@ -2,15 +2,22 @@
 // live Redis bitmap, decoupled from individual status writes
 // (docs/design.md §9).
 //
-// Simplification vs. the design doc: §9 describes a debounced publisher
-// ("at most every ttl seconds, or immediately if idle"). This prototype
-// instead polls on a fixed interval (Config.PublishInterval) and
-// republishes any list whose live version has moved past what was last
-// published. That's simpler to reason about and sufficient to prove the
-// allocator/publisher/API contract end-to-end (docs/design.md §14); true
-// debouncing (publish immediately when a burst of writes goes idle,
-// without waiting for the next tick) is a reasonable fast-follow once
-// this is running against real traffic.
+// Publishing has two paths that both call the same idempotent
+// PublishIfStale, so they never conflict:
+//
+//   - MarkDirty, called right after a status write succeeds, implements
+//     §9's debounce literally: "at most every ttl seconds (or
+//     immediately if idle)" via leadingDebouncer (debounce.go). A write
+//     to a list that hasn't been republished within its own ttl window
+//     publishes right away; a burst of writes within that window
+//     coalesces into a single deferred publish timed for exactly when
+//     the window reopens, bounding resign/compress cost under load.
+//   - Run polls on a fixed interval and republishes any list whose live
+//     version has moved past what was last cached. With MarkDirty in
+//     place this is now a backstop rather than the primary mechanism —
+//     it exists so a list is never left stale indefinitely if
+//     MarkDirty's in-memory debounce state is lost (e.g. a restart
+//     between a write and its scheduled publish).
 package publisher
 
 import (
@@ -44,18 +51,49 @@ type Publisher struct {
 
 	mu    sync.RWMutex
 	cache map[string]*Published
+
+	debounce *leadingDebouncer
 }
 
 func New(bitmaps *store.BitmapStore, meta *store.MetaStore, key *ecdsa.PrivateKey, keyID, baseURL string) *Publisher {
 	return &Publisher{
-		bitmaps: bitmaps,
-		meta:    meta,
-		key:     key,
-		keyID:   keyID,
-		baseURL: baseURL,
-		cache:   make(map[string]*Published),
+		bitmaps:  bitmaps,
+		meta:     meta,
+		key:      key,
+		keyID:    keyID,
+		baseURL:  baseURL,
+		cache:    make(map[string]*Published),
+		debounce: newLeadingDebouncer(),
 	}
 }
+
+// MarkDirty schedules a publish for listID shortly after a status write
+// succeeds — see the package doc for how the debounce/coalescing works.
+// ttlSeconds is the same value that will be embedded in the token, so
+// the debounce floor never publishes more often than what verifiers are
+// told they may cache for.
+func (p *Publisher) MarkDirty(listID string, ttlSeconds int64) {
+	floor := time.Duration(ttlSeconds) * time.Second
+	p.debounce.Trigger(listID, floor, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), dirtyPublishTimeout)
+		defer cancel()
+
+		lm, err := p.meta.GetList(ctx, listID)
+		if err != nil || lm == nil {
+			slog.Error("publisher: dirty-triggered lookup failed", "list_id", listID, "error", err)
+			return
+		}
+		if _, err := p.PublishIfStale(ctx, lm, ttlSeconds); err != nil {
+			slog.Error("publisher: dirty-triggered publish failed", "list_id", listID, "error", err)
+		}
+	})
+}
+
+// dirtyPublishTimeout bounds a MarkDirty-triggered publish, which runs
+// detached from any request context (the HTTP handler that called
+// MarkDirty has typically already returned its response by the time
+// this fires).
+const dirtyPublishTimeout = 30 * time.Second
 
 // Get returns the last-published token for a list, if any has been
 // published yet.
@@ -108,13 +146,14 @@ func (p *Publisher) PublishIfStale(ctx context.Context, lm *store.ListMeta, ttlS
 	p.mu.Lock()
 	p.cache[lm.ID] = pub
 	p.mu.Unlock()
+	slog.Debug("publisher: rebuilt token", "list_id", lm.ID, "version", liveVersion)
 	return pub, nil
 }
 
-// Run polls for dirty lists every interval until ctx is canceled.
-// Prototype scope only ever has one ACTIVE list plus, later, the
-// occasional FROZEN one still accepting status updates; this is cheap to
-// poll directly rather than needing a "dirty set" data structure yet.
+// Run polls every interval and republishes any stale list until ctx is
+// canceled. See the package doc: with MarkDirty handling the common
+// case, this is a backstop, not the primary publish path — cheap to run
+// since PublishIfStale is a no-op for anything already up to date.
 func (p *Publisher) Run(ctx context.Context, interval time.Duration, listIDs func(context.Context) ([]*store.ListMeta, int64, error)) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

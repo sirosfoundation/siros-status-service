@@ -479,3 +479,22 @@ To validate the core claims cheaply before building the full service:
    (only the Redis bitmap is dropped; the row stays so 410 semantics and
    audit history remain available indefinitely) — revisit only if that
    metadata's own storage cost becomes worth reclaiming.
+9. **Done (2026-09-23).** §9's debounced publisher, taken literally:
+   `internal/publisher`'s `MarkDirty` is called right after a status
+   write succeeds and publishes immediately if the list is idle (no
+   publish within its own `ttl` window yet), or coalesces a burst of
+   writes into a single deferred publish timed for exactly when that
+   window reopens — via `leadingDebouncer` (`debounce.go`), a small
+   pure/clock-injectable primitive kept separate from the store and
+   signing dependencies specifically so its coalescing logic could be
+   unit-tested deterministically (no real sleeps, no flakiness) rather
+   than only exercised live. The periodic poll (`Run`) stays as a
+   backstop rather than being removed, in case a restart loses
+   `MarkDirty`'s in-memory debounce state mid-window. Validated live
+   against real Redis/Postgres: a single idle write updated the served
+   ETag in ~10ms despite a 60s poll interval configured (proving
+   `MarkDirty`'s immediate path, not the backstop, did it), and a burst
+   of 6 writes to one list produced exactly 2 rebuilds — one immediate,
+   one coalesced — confirmed via a temporary rebuild log line rather than
+   by polling `GET` (which has its own independent rebuild-if-stale check
+   on every read and would have masked the coalescing behavior).

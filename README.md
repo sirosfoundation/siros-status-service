@@ -10,9 +10,11 @@ claims end to end: the keyed FPE index allocator, spec-conformant
 bit-packing, the allocate/update/publish/cache loop, real rotation on
 both fullness (N_max) and age (T_max), the §8.1 issuer-blind,
 power-of-two-choices distribution pool across K concurrently-ACTIVE
-lists, and the §7 point 4 GC/archival sweeper (archive on expiry +
-grace, purge on retention, 410 after that). The finer §8.2/§8.3 controls
-are deliberately not yet implemented; see "Known gaps" below.
+lists, the §7 point 4 GC/archival sweeper (archive on expiry + grace,
+purge on retention, 410 after that), and §9's debounced publisher
+(publish immediately if idle, coalesce a burst into one deferred publish
+otherwise). The finer §8.2/§8.3 controls are deliberately not yet
+implemented; see "Known gaps" below.
 
 ## Architecture
 
@@ -30,9 +32,15 @@ are deliberately not yet implemented; see "Known gaps" below.
   the spec packs LSB-first) — it does an atomic whole-byte
   read-modify-write via a small Lua script instead.
 - `internal/publisher` — rebuilds and signs a fresh StatusListToken when
-  a list's live version has moved past what was last published. Publishes
-  every ACTIVE and FROZEN list (§7 point 3: a frozen list still accepts
-  status updates until it's archived).
+  a list's live version has moved past what was last published. Two paths
+  call the same idempotent rebuild: `MarkDirty`, triggered right after a
+  status write, implements §9's debounce literally — publish immediately
+  if idle, or coalesce a burst of writes into one deferred publish timed
+  for when the list's own `ttl` window reopens (`debounce.go`'s
+  `leadingDebouncer`, pure and unit-tested in isolation) — and a periodic
+  poll (`Run`) that now serves only as a backstop. Also publishes every
+  ACTIVE and FROZEN list (§7 point 3: a frozen list still accepts status
+  updates until it's archived).
 - `internal/pool` — §8's distribution: keeps a pool of `PoolWidth` (K)
   concurrently-ACTIVE lists healthy (freezing any past `RotationMaxAge`
   — T_max — and topping the pool back up), and picks a target list for
@@ -120,9 +128,6 @@ These are intentionally deferred, not oversights:
   corresponds to a consistent population that could reasonably share a
   ttl policy. Right now there's one `ttl` for everyone
   (`DEFAULT_TTL_SECONDS`).
-- **Debouncing**: the publisher polls on a fixed interval
-  (`PublishInterval`, default 10s) rather than the "immediately if idle"
-  behavior described in §9. See `internal/publisher`'s package doc.
 - **Issuer authentication**: a static bearer-token map, not OAuth2
   client-credentials or mTLS. Fine for a prototype, not for onboarding
   real issuers.
