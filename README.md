@@ -52,27 +52,6 @@ are deliberately not yet implemented; see "Known gaps" below.
   `archived_at + GCRetentionPeriod` have their Redis bitmap dropped. A
   separate background loop, like `internal/pool`'s rotation maintenance.
 
-## Live test deployment
-
-A disposable test instance is running at
-`https://siros-status-service-test.fly.dev`, deployed via `fly.test.toml`
-under a separate app (`siros-status-service-test`) from the canonical
-`fly.toml`/`siros-status-service` config, so testing never touches the
-real app name. **No client auth is configured** on it (`ISSUER_API_KEYS`
-unset — see `internal/api/auth.go`'s no-auth mode), so any caller can
-allocate and revoke against it; treat it as a scratch environment, not
-somewhere to put anything sensitive.
-
-It has its own Fly Postgres (`siros-status-service-test-db`) and Upstash
-Redis (`siros-status-service-test-redis`) attached, both billed
-separately. To tear the whole thing down:
-
-```sh
-fly apps destroy siros-status-service-test -y
-fly apps destroy siros-status-service-test-db -y
-fly redis destroy siros-status-service-test-redis -y
-```
-
 ## Running locally
 
 ```sh
