@@ -1,0 +1,55 @@
+# Standalone Fly app config for cmd/ingestion-service, the `iad` shard
+# (docs/design.md §18: one shard per region, iad + fra to start). See
+# fly.as.toml's header comment for the app-per-service convention this
+# follows, and fly.ingestion.fra.toml for this shard's sibling — the two
+# differ only in app name, region, and SHARD_ID.
+#
+# Internal only — no custom domain. Issuers never see this app's URL
+# directly; they reach it via the single -ingress app's SHARD_BACKENDS
+# routing (docs/design.md §15.6), and BASE_URL below is deliberately the
+# *verifier*'s public custom domain, not this app's own: internal/
+# ingestion/handlers.go builds POST /allocate's `list_url` response field
+# from it, and that's the URL verifiers later fetch.
+#
+# Required secrets before first deploy:
+#   fly secrets set -a siros-status-service-ingestion-iad \
+#     DATABASE_URL="postgres://...same Postgres as -as, -verifier, and -ingestion-fra..." \
+#     REDIS_URL="redis://...this shard's OWN Redis, not shared with fra..." \
+#     SIGNING_KEY_PEM="$(openssl ecparam -name prime256v1 -genkey -noout)"
+#       # ^ StatusListToken signing key — must be the SAME value set on
+#       #   siros-status-service-verifier's and -ingestion-fra's
+#       #   SIGNING_KEY_PEM secret (one signing identity, all shards).
+
+app = "siros-status-service-ingestion-iad"
+primary_region = "iad"
+
+[build]
+
+[env]
+  HTTP_ADDR = ":8080"
+  BASE_URL = "https://lists.t.status.siros.org"
+  SHARD_ID = "iad"
+  AS_JWKS_URL = "https://siros-status-service-as.fly.dev/.well-known/jwks.json"
+  ACCESS_TOKEN_ISSUER = "https://siros-status-service-as.fly.dev"
+
+[processes]
+  app = "/usr/local/bin/ingestion-service"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/healthz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

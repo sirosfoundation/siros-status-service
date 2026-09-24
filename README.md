@@ -209,51 +209,82 @@ Common to every binary: `HTTP_ADDR`, `BASE_URL`, `DATABASE_URL`.
 
 ## Deploying to Fly
 
-Four separate Fly apps, one per binary, each with its own `fly.*.toml`
-(`fly.as.toml`, `fly.ingestion.toml`, `fly.verifier.toml`,
-`fly.ingress.toml`) — this org's convention for a standalone service is
-its own fly config rather than being orchestrated through `sirosid-dev`
-(see [go-zk-circuits](https://github.com/sirosfoundation/go-zk-circuits)'s
-`fly.toml` for another example of the same pattern). All four apps' public
-`*.fly.dev` hostnames are fixed by their app names, so cross-app URLs
-(`AS_JWKS_URL`, `SHARD_BACKENDS`, ingestion's `BASE_URL` pointing at the
-verifier, ...) are already hardcoded in each file — no separate
-render/glue step needed.
+Five Fly apps (docs/design.md §18), each with its own `fly.*.toml` — this
+org's convention for a standalone service is its own fly config rather
+than being orchestrated through `sirosid-dev` (see
+[go-zk-circuits](https://github.com/sirosfoundation/go-zk-circuits)'s
+`fly.toml` for another example of the same pattern):
 
-One shared Postgres (metadata only — `-as`, `-ingestion`, and `-verifier`
-all point at it) and one Redis per shard (`-ingestion` writes to its own
-shard's Redis; `-verifier` needs every shard's Redis URL in
-`SHARD_REDIS_URLS`, since a verifier request can name a list from any
-shard). This prototype config uses a single shard, `default`.
+| app | file | region(s) | public? |
+|---|---|---|---|
+| `siros-status-service-as` | `fly.as.toml` | `iad` | `*.fly.dev` only |
+| `siros-status-service-ingestion-iad` | `fly.ingestion.iad.toml` | `iad` | internal only |
+| `siros-status-service-ingestion-fra` | `fly.ingestion.fra.toml` | `fra` | internal only |
+| `siros-status-service-verifier` | `fly.verifier.toml` | `iad` | **`lists.t.status.siros.org`** |
+| `siros-status-service-ingress` | `fly.ingress.toml` | `iad` + `fra` | **`api.t.status.siros.org`** |
+
+**One shard per region** (`iad`, `fra` to start): each `-ingestion-<region>`
+app is a real, separate shard with its own Redis — that's genuine
+physical isolation, not just geographic spread. `-ingress`, by contrast,
+is one app deployed to *both* regions, because it's fully stateless
+(every region's copy carries the identical `SHARD_BACKENDS` map): a
+custom domain attaches to exactly one Fly app, and Fly's Anycast routes
+each request to whichever of that app's regions is nearest — which only
+works within one app, not across `-ingress-iad`/`-ingress-fra` as
+separate apps. `-as` and `-verifier` stay single-instance in `iad`,
+alongside the shared Postgres primary (docs/design.md §18 on why: token
+issuance and shared metadata reads aren't worth splitting for v1).
+
+One shared Postgres (metadata only — `-as`, every `-ingestion-<region>`,
+and `-verifier` all point at it, single primary, no replicas for v1) and
+one Redis per shard (`-ingestion-<region>` writes to its own; `-verifier`
+needs every shard's Redis URL in `SHARD_REDIS_URLS`, since a verifier
+request can name a list from any shard).
 
 ```sh
 fly apps create siros-status-service-as
-fly apps create siros-status-service-ingestion
+fly apps create siros-status-service-ingestion-iad
+fly apps create siros-status-service-ingestion-fra
 fly apps create siros-status-service-verifier
 fly apps create siros-status-service-ingress
 
-fly postgres create --name siros-status-service-db --region arn
+fly postgres create --name siros-status-service-db --region iad
 fly postgres attach siros-status-service-db -a siros-status-service-as
-fly postgres attach siros-status-service-db -a siros-status-service-ingestion
+fly postgres attach siros-status-service-db -a siros-status-service-ingestion-iad
+fly postgres attach siros-status-service-db -a siros-status-service-ingestion-fra
 fly postgres attach siros-status-service-db -a siros-status-service-verifier
 # `attach` sets each app's DATABASE_URL secret directly — no manual copy needed.
 
-fly redis create --name siros-status-service-redis --region arn --no-replicas
-# fly redis create prints the connection URL once, at creation time — save it.
+fly redis create --name siros-status-service-redis-iad --region iad --no-replicas
+fly redis create --name siros-status-service-redis-fra --region fra --no-replicas
+# fly redis create prints each connection URL once, at creation time — save both.
 
 STATUSLIST_SIGNING_KEY_PEM="$(openssl ecparam -name prime256v1 -genkey -noout)"
 fly secrets set -a siros-status-service-as AS_SIGNING_KEY_PEM="$(openssl ecparam -name prime256v1 -genkey -noout)"
-fly secrets set -a siros-status-service-ingestion SIGNING_KEY_PEM="$STATUSLIST_SIGNING_KEY_PEM" REDIS_URL="<redis URL from above>"
-fly secrets set -a siros-status-service-verifier SIGNING_KEY_PEM="$STATUSLIST_SIGNING_KEY_PEM" SHARD_REDIS_URLS='{"default":"<redis URL from above>"}'
+fly secrets set -a siros-status-service-ingestion-iad SIGNING_KEY_PEM="$STATUSLIST_SIGNING_KEY_PEM" REDIS_URL="<iad redis URL>"
+fly secrets set -a siros-status-service-ingestion-fra SIGNING_KEY_PEM="$STATUSLIST_SIGNING_KEY_PEM" REDIS_URL="<fra redis URL>"
+fly secrets set -a siros-status-service-verifier SIGNING_KEY_PEM="$STATUSLIST_SIGNING_KEY_PEM" \
+  SHARD_REDIS_URLS='{"iad":"<iad redis URL>","fra":"<fra redis URL>"}'
 
 # Deploy order matters only in that the AS should exist before issuers hit
-# it — none of the four block on each other at startup (each only fetches
-# the AS's JWKS lazily, on first token verification), so this order is a
+# it — nothing blocks on anything else at startup (each only fetches the
+# AS's JWKS lazily, on first token verification), so this order is a
 # convenience, not a hard requirement.
 fly deploy -c fly.as.toml
-fly deploy -c fly.ingestion.toml
+fly deploy -c fly.ingestion.iad.toml
+fly deploy -c fly.ingestion.fra.toml
 fly deploy -c fly.verifier.toml
 fly deploy -c fly.ingress.toml
+
+# -ingress starts single-region (primary_region above); add the second
+# region and scale to it explicitly:
+fly regions add fra -a siros-status-service-ingress
+fly scale count 2 -a siros-status-service-ingress --region iad,fra
+
+# Custom domains — one-time per app, then follow each command's printed
+# DNS instructions:
+fly certs add api.t.status.siros.org -a siros-status-service-ingress
+fly certs add lists.t.status.siros.org -a siros-status-service-verifier
 ```
 
 `TRUST_PDP_URL` is deliberately left unset in `fly.as.toml` — see "Known

@@ -914,3 +914,72 @@ proportionally less unallocated capacity left to hide behind, which a
 sufficiently patient observer watching a list's whole lifetime could
 still exploit. Revisit once there's real traffic to reason about instead
 of guessing at reasonable defaults.
+
+## 18. Multi-region deployment: `iad` + `fra`
+
+The first real (non-single-shard-prototype) Fly topology, decided
+directly. Four questions, each with a real fork:
+
+**Model: one shard = one region.** §15.5 already gives the right unit —
+each region gets its own `cmd/ingestion-service` app with its own Redis
+(genuine physical isolation, not just geographic spread), sharing one
+global Postgres. Starting regions: `iad` and `fra`. Adding a region means
+adding a shard: a new `fly.ingestion.<region>.toml`, an entry in `-as`'s
+`SHARDS` list, an entry in `-ingress`'s `SHARD_BACKENDS`, and an entry in
+`-verifier`'s `SHARD_REDIS_URLS`.
+
+**`cmd/ingress-router` is one app in two regions, not two apps.** This
+was the one real implementation surprise: a Fly custom domain attaches to
+exactly one app, and Fly's Anycast only routes across regions *within*
+that one app — two separate `-ingress-iad`/`-ingress-fra` apps could never
+share the single public hostname (`api.t.status.siros.org`, below) with
+automatic nearest-region routing the way one two-region app can. This
+works specifically because `cmd/ingress-router` is fully stateless (every
+region's copy carries the identical `SHARD_BACKENDS` map) — the same
+property that does *not* hold for `cmd/ingestion-service`, which is why
+that one stays genuinely one-app-per-shard instead.
+
+**Custom domains** (the `t.` marks this as the test/staging deployment,
+not production):
+- `api.t.status.siros.org` → `siros-status-service-ingress` — the one
+  URL issuers actually POST/PATCH against (unchanged identity: this was
+  already "the one URL issuers actually POST/PATCH against" on a bare
+  `*.fly.dev` hostname before this section; now it's just branded and
+  anycast-routed too).
+- `lists.t.status.siros.org` → `siros-status-service-verifier` — every
+  list's real public identity: what `internal/publisher` signs into each
+  StatusListToken's `sub` claim, and what every shard's `BASE_URL`
+  constructs `POST /allocate`'s `list_url` response from.
+- `cmd/as` deliberately keeps its bare `*.fly.dev` hostname for now —
+  token issuance (`POST /token`) is a lower-frequency, less "branded
+  public API surface" concern than allocate/status/lists, and giving it
+  its own domain (e.g. `auth.t.status.siros.org`) is a real open question
+  worth deciding separately, not bundled into this pass.
+
+**Shard assignment stays round-robin for now** (`internal/as/shard.go`'s
+existing `AssignOrLookup`, unchanged code) — geography-aware assignment
+(handing a new issuer the *nearest* shard rather than the next one in
+rotation) is a real, separately-scoped improvement, not built here.
+Explicitly noted direction for that improvement: doing this at Fastly's
+edge rather than in `cmd/as` — Fastly's edge already knows each request's
+true geographic origin (unlike `cmd/as`, which only sees whichever region
+Fly's anycast happened to route the token request to), and §16's
+`rust/fastly-ingress-sample` prototype is the concrete artifact that
+would need to become production-real if this direction is pursued
+(replacing `cmd/ingress-router` outright, or feeding a geography hint
+into `cmd/as`'s assignment decision — which of those two shapes is right
+is itself an open question for that future work, not decided here).
+
+**Postgres stays single-primary, `iad`, no read replicas, for v1** —
+`ReserveCursorAndRecord`'s real ACID transaction makes multi-primary a
+much bigger lift than the latency it would save; the `fra` shard's
+allocate/status writes simply pay one cross-region round trip to `iad`,
+same as the general recommendation in §11. `cmd/as` and `cmd/verifier-service`
+live in `iad` alongside it for the same reason — neither is `fra`-region
+write-heavy enough to justify placement elsewhere.
+
+**`cmd/verifier-service` stays single-instance, not per-region, for v1**
+— per §11/README's "Known gaps," the plan is a CDN (Fastly or otherwise)
+in front of it, which is what actually solves per-region *read* latency;
+a verifier replica per region is a later optimization once real
+cache-hit-ratio data justifies it.

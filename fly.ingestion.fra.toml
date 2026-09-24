@@ -1,0 +1,38 @@
+# Standalone Fly app config for cmd/ingestion-service, the `fra` shard
+# (docs/design.md §18: one shard per region, iad + fra to start). Sibling
+# of fly.ingestion.iad.toml — see that file's header comment for the full
+# rationale; this one differs only in app name, region, and SHARD_ID.
+
+app = "siros-status-service-ingestion-fra"
+primary_region = "fra"
+
+[build]
+
+[env]
+  HTTP_ADDR = ":8080"
+  BASE_URL = "https://lists.t.status.siros.org"
+  SHARD_ID = "fra"
+  AS_JWKS_URL = "https://siros-status-service-as.fly.dev/.well-known/jwks.json"
+  ACCESS_TOKEN_ISSUER = "https://siros-status-service-as.fly.dev"
+
+[processes]
+  app = "/usr/local/bin/ingestion-service"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/healthz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

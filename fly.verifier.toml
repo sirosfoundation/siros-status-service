@@ -1,27 +1,48 @@
 # Standalone Fly app config for cmd/verifier-service, the unauthenticated
 # read-only side of the split described in docs/design.md §15.1 — see
-# fly.as.toml's header comment for the four-app convention this follows.
-# This is the app whose URL issuers get back as POST /allocate's
-# `list_url` (see fly.ingestion.toml's BASE_URL) and that verifiers poll.
+# fly.as.toml's header comment for the app-per-service convention this
+# follows. This is the app whose URL issuers get back as POST /allocate's
+# `list_url` (see fly.ingestion.<region>.toml's BASE_URL) and that
+# verifiers poll.
+#
+# Single global instance (docs/design.md §18) — deliberately not one per
+# region like -ingestion; a verifier must be able to answer for ANY
+# shard's lists regardless of which region asks, and the plan is to put
+# this behind a CDN (Fastly or otherwise), which is what actually solves
+# per-region read latency — a verifier replica per region is a later
+# optimization once real cache-hit-ratio data justifies it, not a v1
+# requirement. Lives in `iad`, alongside -as and the shared Postgres
+# primary.
+#
+# Custom domain: lists.t.status.siros.org (docs/design.md §18 — the `t.`
+# marks this as the test/staging deployment, not a production domain) —
+# this is every list's real public identity (what internal/publisher
+# signs into each StatusListToken's `sub`, and what every
+# -ingestion-<region>'s BASE_URL points POST /allocate's `list_url`
+# response at). One-time setup:
+#   fly certs add lists.t.status.siros.org -a siros-status-service-verifier
+# then follow the printed DNS instructions (a CNAME to
+# siros-status-service-verifier.fly.dev, unless the app has a dedicated
+# IP, in which case fly certs add prints A/AAAA records instead).
 #
 # Required secrets before first deploy:
 #   fly secrets set -a siros-status-service-verifier \
-#     DATABASE_URL="postgres://...same Postgres as -as and -ingestion..." \
-#     SIGNING_KEY_PEM="...same value as -ingestion's SIGNING_KEY_PEM..." \
-#     SHARD_REDIS_URLS='{"default":"redis://...this shard's Redis..."}'
+#     DATABASE_URL="postgres://...same Postgres as -as and every -ingestion-<region>..." \
+#     SIGNING_KEY_PEM="...same value as every -ingestion-<region>'s SIGNING_KEY_PEM..." \
+#     SHARD_REDIS_URLS='{"iad":"redis://...iad shard's Redis...","fra":"redis://...fra shard's Redis..."}'
 #       # ^ JSON object, shard_id -> Redis URL — one entry per shard this
-#       #   instance can serve (all of them, since sharding is logical, not
-#       #   physical, per README.md "Known gaps"). Add an entry per shard
-#       #   as more are introduced.
+#       #   instance can serve (all of them: a verifier can't know in
+#       #   advance which shard a requested list_id belongs to). Add an
+#       #   entry per shard as more regions are introduced.
 
 app = "siros-status-service-verifier"
-primary_region = "arn"
+primary_region = "iad"
 
 [build]
 
 [env]
   HTTP_ADDR = ":8080"
-  BASE_URL = "https://siros-status-service-verifier.fly.dev"
+  BASE_URL = "https://lists.t.status.siros.org"
 
 [processes]
   app = "/usr/local/bin/verifier-service"

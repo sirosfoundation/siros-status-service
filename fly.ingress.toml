@@ -1,16 +1,35 @@
 # Standalone Fly app config for cmd/ingress-router, the JWT-claim-routing
 # layer described in docs/design.md §15.6 — see fly.as.toml's header
-# comment for the four-app convention this follows. This is the one URL
-# issuers actually POST/PATCH against; it verifies their access token
-# offline (same AS JWKS every other consumer trusts) and proxies to the
-# shard named by the token's tenant_id claim.
+# comment for the app-per-service convention this follows. This is the
+# one URL issuers actually POST/PATCH against; it verifies their access
+# token offline (same AS JWKS every other consumer trusts) and proxies to
+# the shard named by the token's tenant_id claim.
+#
+# ONE app, deployed to BOTH shard regions (docs/design.md §18) — unlike
+# -ingestion (genuinely one app per shard, each with its own Redis), this
+# app is fully stateless: every region's copy carries the identical
+# SHARD_BACKENDS map and can route to either shard. That's what makes it
+# a fit for Fly's built-in Anycast multi-region routing: a custom domain
+# attaches to exactly one Fly app, and Anycast automatically sends each
+# request to whichever of that app's regions is nearest — which only
+# works when the regions are machines of the SAME app, not separate
+# per-region apps (confirmed against Fly's docs before choosing this
+# shape over the per-region-app pattern -ingestion uses). First deploy
+# goes to primary_region; add the second region afterward with:
+#   fly regions add fra -a siros-status-service-ingress
+#   fly scale count 2 -a siros-status-service-ingress --region iad,fra
+#
+# Custom domain: api.t.status.siros.org (the `t.` marks this as the
+# test/staging deployment, not production). One-time setup:
+#   fly certs add api.t.status.siros.org -a siros-status-service-ingress
+# then follow the printed DNS instructions.
 #
 # No DATABASE_URL/secrets needed — this app holds no state and never
 # calls the AS synchronously (docs/design.md §15.3: it only fetches and
 # caches the AS's JWKS, same as -ingestion).
 
 app = "siros-status-service-ingress"
-primary_region = "arn"
+primary_region = "iad"
 
 [build]
 
@@ -19,8 +38,10 @@ primary_region = "arn"
   AS_JWKS_URL = "https://siros-status-service-as.fly.dev/.well-known/jwks.json"
   ACCESS_TOKEN_ISSUER = "https://siros-status-service-as.fly.dev"
   # shard_id -> that shard's ingestion-service base URL (docs/design.md
-  # §15.5/§15.6). Add an entry per shard as more are introduced.
-  SHARD_BACKENDS = '{"default":"https://siros-status-service-ingestion.fly.dev"}'
+  # §15.5/§15.6/§18) — every region of THIS app carries the same map, so
+  # either shard is reachable regardless of which region a request lands
+  # in. Add an entry per shard as more regions are introduced.
+  SHARD_BACKENDS = '{"iad":"https://siros-status-service-ingestion-iad.fly.dev","fra":"https://siros-status-service-ingestion-fra.fly.dev"}'
 
 [processes]
   app = "/usr/local/bin/ingress-router"
