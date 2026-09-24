@@ -816,3 +816,81 @@ Fastly's most mature Compute SDK (their own JWT tutorial is written in
 Rust, not Go), and `serde`'s compile-time JSON handling is a better fit
 for WASM than Go's reflection-based `encoding/json` — Go on Compute is
 officially supported but the newer, less-proven path for this pattern.
+
+## 17. Decoy noise: herd immunity for real revocations
+
+**The leak this closes:** draft-ietf-oauth-status-list-21 publishes the
+raw packed bitmap, not per-index answers — anyone who fetches
+`GET /lists/{id}` can decode every entry, not just the one they were
+checking. Because allocation used to be metadata-only (§7 point 2: "no
+bitmap write happens here, new entries default to VALID via the bitmap's
+zero-initialization"), every non-VALID byte was otherwise unambiguous: it
+could only be a real credential a real issuer really revoked or
+suspended. Downloading the list and diffing it over time is therefore a
+way to count, and potentially correlate, real revocation events — the
+same class of leak §8's issuer-blind pool placement already defends
+against for *list choice*, just through *bit values* instead.
+
+**The fix (decided 2026-09-24), matching chaff traffic in an anonymity
+network:** `internal/decoy.Noiser` periodically flips a random sample of
+never-yet-allocated indices to a real non-VALID state too, so a non-VALID
+bit alone no longer proves a real revocation happened. Three decisions,
+walked through directly:
+
+1. **Correctness guard — allocation now writes explicit VALID (chosen
+   over leaving allocation metadata-only and having the decoy worker
+   merely check Postgres before every flip).** This ends §7's
+   "allocation is metadata-only" property: `POST /allocate` now does one
+   Redis write (`internal/ingestion`'s `handleAllocate`) forcing the
+   freshly-reserved index back to VALID, unconditionally overwriting any
+   decoy noise that might be sitting on it from before it was ever
+   handed out. Chosen because it makes the corruption race — a decoy
+   flip landing on an index that gets *really* allocated moments later,
+   which would otherwise hand a brand-new credential a phantom REVOKED/
+   SUSPENDED status — impossible by construction rather than merely
+   unlikely. The cost (one extra Redis round trip per allocation) is the
+   same order of cost a `PATCH /status` call already pays.
+2. **Noise policy — raw knobs (`DECOY_NOISE_RATE`, `DECOY_CHECK_INTERVAL`),
+   not revocation-rate-adaptive density.** Same "raw knobs for the
+   prototype" philosophy as §8.2's `N_max`/`T_max`/`K` — hand-tuned rather
+   than auto-derived, since there's no real traffic data yet to tune
+   adaptive density against. `DECOY_NOISE_RATE` defaults to `0`
+   (disabled) — unlike the rotation knobs, this is a new, not-yet-
+   battle-tested behavior change with a real (now-closed) correctness
+   edge case, so it stays opt-in rather than on-by-default, the same
+   posture as `TRUST_PDP_URL` defaulting to unset.
+3. **Scope — ACTIVE, FROZEN, and ARCHIVED-not-yet-purged lists
+   (`internal/store.MetaStore.NoiseLists`), not ACTIVE-only.** An
+   ARCHIVED list's cursor is permanently frozen (nothing beyond it will
+   ever be allocated, since it no longer accepts issuance), so noising
+   its unallocated tail carries zero collision risk regardless of point
+   1 above — maximizing camouflage coverage costs nothing extra there.
+   ACTIVE/FROZEN lists rely on point 1's explicit-VALID-write for the
+   same safety.
+
+**Decoy dynamics deliberately mirror real ones exactly**
+(`nextDecoyStatus`): a VALID decoy moves to either INVALID or SUSPENDED;
+a SUSPENDED decoy may revert to VALID (a real suspension can be lifted)
+or stay put; an INVALID decoy never changes again (a real revocation is
+permanent). Anything statistically distinguishable from a real entry's
+behavior — e.g. decoys that always revert, or that use a state real
+credentials never do — would let a sophisticated observer filter decoys
+back out, defeating the whole point. A decoy flip is cache-invalidated
+through the same `publisher.MarkDirty` path a real status change uses,
+so cache behavior doesn't distinguish them either.
+
+**Safety invariant:** a decoy candidate index is always derived from a
+cursor position at or beyond a list's *current* cursor at read time —
+`internal/store.ReserveCursorAndRecord`'s atomic cursor bump means a
+position, once consumed, is never a decoy candidate again. Combined with
+point 1's explicit reset, this holds for ACTIVE and FROZEN lists too, not
+just the collision-free ARCHIVED case.
+
+**Deliberately simplified for this pass:** the noise rate is a flat
+fraction of a list's *remaining* capacity per check interval, not scaled
+to that list's actual real revocation rate (point 2 above) or to how
+close a list is to being fully consumed — a list nearing its `N_max` has
+proportionally less unallocated capacity left to hide behind, which a
+sufficiently patient observer watching a list's whole lifetime could
+still exploit. Revisit once there's real traffic to reason about instead
+of guessing at reasonable defaults.

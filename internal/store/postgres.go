@@ -84,6 +84,10 @@ type ListMeta struct {
 	// ShardID names which ingestion shard owns this list (docs/design.md
 	// §15.5). Defaults to "default" for single-shard deployments.
 	ShardID string
+	// Purged is true once GC has dropped this list's Redis bitmap (docs/
+	// design.md §7 point 4) — internal/decoy checks this before noising
+	// an ARCHIVED list, since there's no bitmap left to write to.
+	Purged bool
 }
 
 // Remaining returns how many unallocated slots this list has left.
@@ -134,12 +138,12 @@ func (m *MetaStore) CreateList(ctx context.Context, id string, bits int, size ui
 	return &ListMeta{ID: id, Bits: bits, Size: size, FPEKey: fpeKey, State: "ACTIVE", ShardID: shardID}, nil
 }
 
-const listColumns = `id, bits, size, cursor, fpe_key, max_exp, state, created_at, archived_at, shard_id`
+const listColumns = `id, bits, size, cursor, fpe_key, max_exp, state, created_at, archived_at, shard_id, purged`
 
 func scanListMeta(row pgx.Row) (*ListMeta, error) {
 	var lm ListMeta
 	var size, cursor int64
-	if err := row.Scan(&lm.ID, &lm.Bits, &size, &cursor, &lm.FPEKey, &lm.MaxExp, &lm.State, &lm.CreatedAt, &lm.ArchivedAt, &lm.ShardID); err != nil {
+	if err := row.Scan(&lm.ID, &lm.Bits, &size, &cursor, &lm.FPEKey, &lm.MaxExp, &lm.State, &lm.CreatedAt, &lm.ArchivedAt, &lm.ShardID, &lm.Purged); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
@@ -172,6 +176,20 @@ func (m *MetaStore) ActiveLists(ctx context.Context, shardID string) ([]*ListMet
 // as long as it's within its retention window.
 func (m *MetaStore) LiveLists(ctx context.Context, shardID string) ([]*ListMeta, error) {
 	return m.queryLists(ctx, `WHERE shard_id = $1 AND state IN ('ACTIVE', 'FROZEN') ORDER BY created_at ASC`, shardID)
+}
+
+// NoiseLists returns every list in shardID that internal/decoy may inject
+// camouflage noise into (docs/design.md §17): ACTIVE and FROZEN lists (the
+// same population LiveLists returns, for the same reason — they still have
+// a live bitmap and unallocated capacity worth disguising) plus ARCHIVED
+// lists that GC hasn't purged yet. An ARCHIVED list's cursor is frozen
+// (nothing beyond it will ever be allocated, since it no longer accepts
+// new issuance), so noising its unallocated tail carries zero risk of ever
+// colliding with a real future allocation — unlike ACTIVE/FROZEN, which
+// only avoid that collision via the explicit VALID-reset internal/ingestion
+// does at allocation time (see its handleAllocate).
+func (m *MetaStore) NoiseLists(ctx context.Context, shardID string) ([]*ListMeta, error) {
+	return m.queryLists(ctx, `WHERE shard_id = $1 AND state IN ('ACTIVE', 'FROZEN', 'ARCHIVED') AND purged = false ORDER BY created_at ASC`, shardID)
 }
 
 func (m *MetaStore) queryLists(ctx context.Context, whereOrderBy string, args ...any) ([]*ListMeta, error) {

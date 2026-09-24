@@ -56,6 +56,14 @@ type IngestionConfig struct {
 	// PublishInterval is the periodic-republish backstop interval (§9).
 	PublishInterval time.Duration
 
+	// DecoyNoiseRate is the fraction (0, 1] of a list's never-allocated
+	// capacity internal/decoy targets per check pass (§17). Zero (the
+	// default) disables decoy noising entirely.
+	DecoyNoiseRate float64
+	// DecoyCheckInterval is how often internal/decoy sweeps this shard's
+	// lists for noise injection.
+	DecoyCheckInterval time.Duration
+
 	GCGracePeriod     time.Duration
 	GCRetentionPeriod time.Duration
 	GCCheckInterval   time.Duration
@@ -88,6 +96,8 @@ func LoadIngestion() (*IngestionConfig, error) {
 		PoolCheckInterval:   30 * time.Second,
 		DefaultTTLSeconds:   3600,
 		PublishInterval:     10 * time.Second,
+		DecoyNoiseRate:      0, // opt-in (§17): unverified against real traffic, never on by default
+		DecoyCheckInterval:  15 * time.Minute,
 		GCGracePeriod:       24 * time.Hour,
 		GCRetentionPeriod:   30 * 24 * time.Hour,
 		GCCheckInterval:     time.Hour,
@@ -116,6 +126,12 @@ func LoadIngestion() (*IngestionConfig, error) {
 		return nil, err
 	}
 	if c.PublishInterval, err = getDurationEnv("PUBLISH_INTERVAL", c.PublishInterval); err != nil {
+		return nil, err
+	}
+	if c.DecoyNoiseRate, err = getFloat64Env("DECOY_NOISE_RATE", c.DecoyNoiseRate); err != nil {
+		return nil, err
+	}
+	if c.DecoyCheckInterval, err = getDurationEnv("DECOY_CHECK_INTERVAL", c.DecoyCheckInterval); err != nil {
 		return nil, err
 	}
 	if c.GCGracePeriod, err = getDurationEnv("GC_GRACE_PERIOD", c.GCGracePeriod); err != nil {
@@ -339,6 +355,18 @@ func getUint64Env(key string, def uint64) (uint64, error) {
 		return 0, fmt.Errorf("config: %s: %w", key, err)
 	}
 	return n, nil
+}
+
+func getFloat64Env(key string, def float64) (float64, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s: %w", key, err)
+	}
+	return f, nil
 }
 
 func getDurationEnv(key string, def time.Duration) (time.Duration, error) {

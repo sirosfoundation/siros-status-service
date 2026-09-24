@@ -68,6 +68,23 @@ func (s *Server) handleAllocate(c *gin.Context) {
 			return
 		}
 
+		// Explicit reset to VALID (docs/design.md §17): allocation used to
+		// be metadata-only, relying on the bitmap's zero-initialization to
+		// make a fresh index read VALID. Now that internal/decoy can write
+		// camouflage noise into never-yet-allocated capacity, a newly
+		// allocated index might have decoy noise sitting on it from before
+		// it was handed out — this write unconditionally clears that,
+		// before the response (and therefore the index) ever reaches the
+		// issuer. internal/decoy never targets a position once its cursor
+		// slot has been consumed, so this is a one-time reset, not an
+		// ongoing race.
+		byteIndex, bitOffset := statuslist.ByteOffset(idx, lm.Bits)
+		if _, err := s.bitmaps.SetStatus(ctx, lm.ID, byteIndex, bitOffset, lm.Bits, byte(statuslist.StatusValid)); err != nil {
+			c.JSON(500, gin.H{"error": "could not initialize allocated index"})
+			return
+		}
+		s.pub.MarkDirty(lm.ID, s.cfg.DefaultTTLSeconds)
+
 		c.JSON(201, allocateResponse{
 			ListURL: s.cfg.BaseURL + "/lists/" + lm.ID,
 			Index:   idx,

@@ -27,3 +27,10 @@ override:
     path: ^internal/pool$
   - threshold: 15
     path: ^internal/pool/pool\.go$
+  # internal/decoy's pure decision logic (nextDecoyStatus, §17) is fully
+  # tested; Sweep/sweepList/NewNoiser/Run need live Postgres/Redis, same
+  # reason as pool — actual measured coverage is ~12.7%, hence 10 not 15.
+  - threshold: 10
+    path: ^internal/decoy$
+  - threshold: 10
+    path: ^internal/decoy/decoy\.go$

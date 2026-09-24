@@ -186,6 +186,8 @@ Common to every binary: `HTTP_ADDR`, `BASE_URL`, `DATABASE_URL`.
 | `GC_CHECK_INTERVAL` | `1h` | |
 | `DEFAULT_TTL_SECONDS` | `3600` | see "Known gaps" re: per-issuer ttl |
 | `PUBLISH_INTERVAL` | `10s` | backstop poll interval (§9) |
+| `DECOY_NOISE_RATE` | `0` (disabled) | fraction of never-allocated capacity flipped per pass (§17 — "herd immunity" for real revocations); opt-in |
+| `DECOY_CHECK_INTERVAL` | `15m` | how often the decoy sweep runs, when `DECOY_NOISE_RATE` > 0 |
 
 **`cmd/verifier-service`**
 
@@ -285,6 +287,14 @@ These are intentionally deferred, not oversights:
   "count ACTIVE lists, then create more if under Width" can transiently
   overshoot `POOL_WIDTH` under a race. Harmless at prototype scale (see
   the package doc).
+- **Decoy noise (§17) is a flat rate, not revocation-rate-adaptive**:
+  `DECOY_NOISE_RATE` disguises real revocations with a constant fraction
+  of a list's *remaining* capacity, not one scaled to that list's actual
+  revocation rate or to how close it is to full — a list nearing
+  `N_max` has proportionally less unallocated capacity left to hide
+  behind. Off by default (`DECOY_NOISE_RATE=0`); the correctness guard
+  it depends on (explicit VALID-reset at allocation) is real and tested,
+  but the feature itself hasn't run against real traffic yet.
 
 ## Verified against the spec
 

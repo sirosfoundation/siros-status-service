@@ -15,6 +15,7 @@ import (
 	tokenauthvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 
 	"github.com/sirosfoundation/siros-status-service/internal/config"
+	"github.com/sirosfoundation/siros-status-service/internal/decoy"
 	"github.com/sirosfoundation/siros-status-service/internal/gc"
 	"github.com/sirosfoundation/siros-status-service/internal/ingestion"
 	"github.com/sirosfoundation/siros-status-service/internal/pool"
@@ -72,11 +73,15 @@ func run() error {
 	pub := publisher.New(map[string]*store.BitmapStore{cfg.ShardID: bitmaps}, meta, cfg.SigningKey, cfg.SigningKeyID, cfg.BaseURL)
 	pm := pool.NewManager(meta, bitmaps, cfg.ShardID, cfg.PoolWidth, cfg.ListCapacity, cfg.ListBits, cfg.RotationMaxAge)
 	sweeper := gc.NewSweeper(meta, bitmaps, cfg.GCGracePeriod, cfg.GCRetentionPeriod)
+	// §17: off by default (DecoyNoiseRate == 0 makes Sweep a no-op), opt in
+	// via DECOY_NOISE_RATE.
+	noiser := decoy.NewNoiser(meta, bitmaps, pub, cfg.ShardID, cfg.DecoyNoiseRate, cfg.DefaultTTLSeconds)
 
 	srv := ingestion.New(cfg, meta, bitmaps, pub, pm, validator)
 	go pub.Run(ctx, cfg.PublishInterval, srv.ListsForPublishing)
 	go pm.Run(ctx, cfg.PoolCheckInterval)
 	go sweeper.Run(ctx, cfg.GCCheckInterval)
+	go noiser.Run(ctx, cfg.DecoyCheckInterval)
 
 	httpSrv := &http.Server{Addr: cfg.HTTPAddr, Handler: srv.Router()}
 	go func() {
