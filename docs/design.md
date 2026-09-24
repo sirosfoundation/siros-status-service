@@ -680,7 +680,16 @@ forwards the request to that shard's configured backend URL
 (`SHARD_BACKENDS`, a static `shard_id -> URL` map). A request with an
 invalid/unverifiable token is rejected at the router (401) before it ever
 reaches a shard; a valid token naming an unconfigured shard is a 502.
-This keeps shard topology out of issuers' hands entirely — they only ever
+The 401 carries an RFC 6750 §3 `WWW-Authenticate` challenge: a missing
+or malformed `Authorization` header gets `Bearer error="invalid_request"`
+(the request itself is malformed), while a token that was presented but
+rejected by the validator gets `Bearer error="invalid_token",
+error_description="..."`, with the description calling out an expired
+token specifically (`errors.Is` against both go-jose/go-jose's
+`jwt.ErrExpired` on the asymmetric path and golang-jwt/v5's
+`jwt.ErrTokenExpired` on the legacy path) versus a generic description
+for every other rejection reason (bad signature, wrong issuer, unknown
+`kid`, etc.). This keeps shard topology out of issuers' hands entirely — they only ever
 see one router URL, and the token's `tenant_id` (not anything the issuer
 supplies directly) decides where their traffic actually lands.
 

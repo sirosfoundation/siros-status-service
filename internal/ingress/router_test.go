@@ -118,6 +118,11 @@ func TestRouter_RejectsMissingToken(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", resp.StatusCode)
 	}
+	// RFC 6750 §3: no bearer token was even presented, so the challenge
+	// is invalid_request, not invalid_token.
+	if want, got := `Bearer error="invalid_request"`, resp.Header.Get("WWW-Authenticate"); got != want {
+		t.Errorf("WWW-Authenticate = %q, want %q", got, want)
+	}
 }
 
 func TestRouter_RejectsInvalidToken(t *testing.T) {
@@ -138,6 +143,86 @@ func TestRouter_RejectsInvalidToken(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", resp.StatusCode)
+	}
+	if want, got := `Bearer error="invalid_token", error_description="the access token is invalid"`, resp.Header.Get("WWW-Authenticate"); got != want {
+		t.Errorf("WWW-Authenticate = %q, want %q", got, want)
+	}
+}
+
+func TestRouter_RejectsExpiredToken(t *testing.T) {
+	km, validator := testValidator(t)
+	router, err := New(validator, map[string]string{"shard-a": "http://unused.invalid"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	proxySrv := httptest.NewServer(router)
+	defer proxySrv.Close()
+
+	// A negative TTL mints a token whose exp is already in the past.
+	token, err := km.Issue(accesstoken.IssueParams{
+		Issuer:   testIssuer,
+		Audience: testAudience,
+		Subject:  "issuer-a",
+		TenantID: "shard-a",
+		TAC:      "riw",
+		TTL:      -time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("issue expired token: %v", err)
+	}
+
+	req, _ := http.NewRequest(http.MethodPost, proxySrv.URL+"/allocate", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", resp.StatusCode)
+	}
+	if want, got := `Bearer error="invalid_token", error_description="the access token expired"`, resp.Header.Get("WWW-Authenticate"); got != want {
+		t.Errorf("WWW-Authenticate = %q, want %q", got, want)
+	}
+}
+
+func TestRouter_RejectsWrongIssuerToken(t *testing.T) {
+	km, validator := testValidator(t)
+	router, err := New(validator, map[string]string{"shard-a": "http://unused.invalid"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	proxySrv := httptest.NewServer(router)
+	defer proxySrv.Close()
+
+	// A token that is otherwise well-formed and signed by the right key,
+	// but carries an issuer the validator doesn't accept: a rejection
+	// reason distinct from expiry, which should still get invalid_token
+	// but the generic (non-expiry) description.
+	token, err := km.Issue(accesstoken.IssueParams{
+		Issuer:   "https://not-the-expected-issuer.example.org",
+		Audience: testAudience,
+		Subject:  "issuer-a",
+		TenantID: "shard-a",
+		TAC:      "riw",
+		TTL:      time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("issue wrong-issuer token: %v", err)
+	}
+
+	req, _ := http.NewRequest(http.MethodPost, proxySrv.URL+"/allocate", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", resp.StatusCode)
+	}
+	if want, got := `Bearer error="invalid_token", error_description="the access token is invalid"`, resp.Header.Get("WWW-Authenticate"); got != want {
+		t.Errorf("WWW-Authenticate = %q, want %q", got, want)
 	}
 }
 

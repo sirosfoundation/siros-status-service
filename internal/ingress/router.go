@@ -9,10 +9,14 @@
 package ingress
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
+
+	gojosejwt "github.com/go-jose/go-jose/v4/jwt"
+	golangjwt "github.com/golang-jwt/jwt/v5"
 
 	tokenauthvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 )
@@ -41,12 +45,17 @@ func New(validator *tokenauthvalidator.Validator, backends map[string]string) (*
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	token, ok := strings.CutPrefix(req.Header.Get("Authorization"), "Bearer ")
 	if !ok || token == "" {
+		// RFC 6750 §3: the request itself is malformed (no bearer
+		// token was even presented), as distinct from a bearer token
+		// that was presented but rejected.
+		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_request"`)
 		http.Error(w, "missing or malformed Authorization header", http.StatusUnauthorized)
 		return
 	}
 
 	result, err := r.validator.Validate(req.Context(), token)
 	if err != nil {
+		w.Header().Set("WWW-Authenticate", bearerInvalidTokenChallenge(err))
 		http.Error(w, "invalid access token", http.StatusUnauthorized)
 		return
 	}
@@ -57,4 +66,19 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	proxy.ServeHTTP(w, req)
+}
+
+// bearerInvalidTokenChallenge builds the RFC 6750 §3 WWW-Authenticate
+// challenge for a rejected bearer token, distinguishing an expired
+// token (via the expiry sentinels from both the asymmetric-token path,
+// which validates claims with go-jose/go-jose's jwt package, and the
+// legacy HMAC path, which uses golang-jwt/jwt/v5) from every other
+// rejection reason. There is no separate "expired" error code in RFC
+// 6750 — expiry is signaled via error_description on invalid_token.
+func bearerInvalidTokenChallenge(err error) string {
+	description := "the access token is invalid"
+	if errors.Is(err, gojosejwt.ErrExpired) || errors.Is(err, golangjwt.ErrTokenExpired) {
+		description = "the access token expired"
+	}
+	return `Bearer error="invalid_token", error_description="` + description + `"`
 }
