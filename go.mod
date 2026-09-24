@@ -4,9 +4,11 @@ go 1.26.6
 
 require (
 	github.com/gin-gonic/gin v1.12.0
+	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/redis/go-redis/v9 v9.22.0
+	github.com/sirosfoundation/go-tokenauth v0.4.0
 )
 
 require (

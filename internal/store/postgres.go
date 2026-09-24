@@ -8,6 +8,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/sirosfoundation/siros-status-service/internal/pgutil"
 )
 
 // ErrListFull is returned by ReserveCursorAndRecord when the targeted
@@ -33,7 +35,8 @@ CREATE TABLE IF NOT EXISTS lists (
 	state       text NOT NULL DEFAULT 'ACTIVE',
 	created_at  timestamptz NOT NULL DEFAULT now(),
 	archived_at timestamptz,
-	purged      boolean NOT NULL DEFAULT false
+	purged      boolean NOT NULL DEFAULT false,
+	shard_id    text NOT NULL DEFAULT 'default'
 );
 
 -- Idempotent migrations for tables created before these columns existed
@@ -41,6 +44,8 @@ CREATE TABLE IF NOT EXISTS lists (
 -- a no-op against an existing table, so new columns need adding here too.
 ALTER TABLE lists ADD COLUMN IF NOT EXISTS archived_at timestamptz;
 ALTER TABLE lists ADD COLUMN IF NOT EXISTS purged boolean NOT NULL DEFAULT false;
+ALTER TABLE lists ADD COLUMN IF NOT EXISTS shard_id text NOT NULL DEFAULT 'default';
+CREATE INDEX IF NOT EXISTS lists_shard_state_idx ON lists (shard_id, state);
 
 CREATE TABLE IF NOT EXISTS allocations (
 	list_id    text NOT NULL REFERENCES lists(id),
@@ -49,6 +54,17 @@ CREATE TABLE IF NOT EXISTS allocations (
 	exp        timestamptz NOT NULL,
 	created_at timestamptz NOT NULL DEFAULT now(),
 	PRIMARY KEY (list_id, idx)
+);
+
+-- docs/design.md §15.4: per-issuer index-position accounting, incremented
+-- in the same transaction as the allocation it counts (see
+-- ReserveCursorAndRecord) so it can never drift from reality.
+CREATE TABLE IF NOT EXISTS issuer_usage (
+	issuer_id   text NOT NULL,
+	shard_id    text NOT NULL,
+	index_count bigint NOT NULL DEFAULT 0,
+	updated_at  timestamptz NOT NULL DEFAULT now(),
+	PRIMARY KEY (issuer_id, shard_id)
 );
 `
 
@@ -65,6 +81,9 @@ type ListMeta struct {
 	State      string
 	CreatedAt  time.Time
 	ArchivedAt *time.Time
+	// ShardID names which ingestion shard owns this list (docs/design.md
+	// §15.5). Defaults to "default" for single-shard deployments.
+	ShardID string
 }
 
 // Remaining returns how many unallocated slots this list has left.
@@ -89,33 +108,38 @@ func NewMetaStore(ctx context.Context, dsn string) (*MetaStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: connect postgres: %w", err)
 	}
-	if _, err := pool.Exec(ctx, schema); err != nil {
+	// Advisory-locked: multiple ingestion-service instances (one per
+	// shard, docs/design.md §15.5) share this Postgres and may start
+	// concurrently, all applying this same schema — see pgutil.ApplySchema
+	// for the real race this closes.
+	if err := pgutil.ApplySchema(ctx, pool, "siros-status-service:store-schema", schema); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("store: apply schema: %w", err)
+		return nil, fmt.Errorf("store: %w", err)
 	}
 	return &MetaStore{pool: pool}, nil
 }
 
 func (m *MetaStore) Close() { m.pool.Close() }
 
-// CreateList inserts a new list row in ACTIVE state.
-func (m *MetaStore) CreateList(ctx context.Context, id string, bits int, size uint64, fpeKey []byte) (*ListMeta, error) {
+// CreateList inserts a new list row in ACTIVE state, owned by shardID
+// (docs/design.md §15.5; pass "default" for single-shard deployments).
+func (m *MetaStore) CreateList(ctx context.Context, id string, bits int, size uint64, fpeKey []byte, shardID string) (*ListMeta, error) {
 	_, err := m.pool.Exec(ctx,
-		`INSERT INTO lists (id, bits, size, fpe_key) VALUES ($1, $2, $3, $4)`,
-		id, bits, int64(size), fpeKey,
+		`INSERT INTO lists (id, bits, size, fpe_key, shard_id) VALUES ($1, $2, $3, $4, $5)`,
+		id, bits, int64(size), fpeKey, shardID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("store: create list: %w", err)
 	}
-	return &ListMeta{ID: id, Bits: bits, Size: size, FPEKey: fpeKey, State: "ACTIVE"}, nil
+	return &ListMeta{ID: id, Bits: bits, Size: size, FPEKey: fpeKey, State: "ACTIVE", ShardID: shardID}, nil
 }
 
-const listColumns = `id, bits, size, cursor, fpe_key, max_exp, state, created_at, archived_at`
+const listColumns = `id, bits, size, cursor, fpe_key, max_exp, state, created_at, archived_at, shard_id`
 
 func scanListMeta(row pgx.Row) (*ListMeta, error) {
 	var lm ListMeta
 	var size, cursor int64
-	if err := row.Scan(&lm.ID, &lm.Bits, &size, &cursor, &lm.FPEKey, &lm.MaxExp, &lm.State, &lm.CreatedAt, &lm.ArchivedAt); err != nil {
+	if err := row.Scan(&lm.ID, &lm.Bits, &size, &cursor, &lm.FPEKey, &lm.MaxExp, &lm.State, &lm.CreatedAt, &lm.ArchivedAt, &lm.ShardID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
@@ -125,31 +149,33 @@ func scanListMeta(row pgx.Row) (*ListMeta, error) {
 	return &lm, nil
 }
 
-// ActiveLists returns every list currently in ACTIVE state — the pool
-// that internal/pool's power-of-two-choices distribution (§8.1) picks
-// from. Ordered oldest-first, which has no correctness significance but
-// keeps output deterministic for tests.
-func (m *MetaStore) ActiveLists(ctx context.Context) ([]*ListMeta, error) {
-	return m.queryLists(ctx, `WHERE state = 'ACTIVE' ORDER BY created_at ASC`)
+// ActiveLists returns every list currently in ACTIVE state within
+// shardID — the pool that internal/pool's power-of-two-choices
+// distribution (§8.1) picks from. A shard's pool.Manager only ever sees
+// and rotates its own shard's lists (docs/design.md §15.5). Ordered
+// oldest-first, which has no correctness significance but keeps output
+// deterministic for tests.
+func (m *MetaStore) ActiveLists(ctx context.Context, shardID string) ([]*ListMeta, error) {
+	return m.queryLists(ctx, `WHERE shard_id = $1 AND state = 'ACTIVE' ORDER BY created_at ASC`, shardID)
 }
 
-// LiveLists returns every list the periodic publisher should keep
-// republishing: ACTIVE ones (still accepting new allocations) and
-// FROZEN ones (no longer accepting allocations, but still accepting
-// status updates until GC archives them — §7 point 3). ARCHIVED lists
-// are excluded deliberately, not because GC doesn't exist: once
-// archived, a list accepts no further writes (internal/api enforces
-// this), so its version can never change again — there's nothing for
-// periodic republishing to do. internal/api's handleGetList still
-// serves an ARCHIVED list on direct request (via the same
+// LiveLists returns every list in shardID that the periodic publisher
+// should keep republishing: ACTIVE ones (still accepting new
+// allocations) and FROZEN ones (no longer accepting allocations, but
+// still accepting status updates until GC archives them — §7 point 3).
+// ARCHIVED lists are excluded deliberately, not because GC doesn't
+// exist: once archived, a list accepts no further writes (internal/api
+// enforces this), so its version can never change again — there's
+// nothing for periodic republishing to do. internal/api's handleGetList
+// still serves an ARCHIVED list on direct request (via the same
 // PublishIfStale, which is a no-op cache hit after the one rebuild) for
 // as long as it's within its retention window.
-func (m *MetaStore) LiveLists(ctx context.Context) ([]*ListMeta, error) {
-	return m.queryLists(ctx, `WHERE state IN ('ACTIVE', 'FROZEN') ORDER BY created_at ASC`)
+func (m *MetaStore) LiveLists(ctx context.Context, shardID string) ([]*ListMeta, error) {
+	return m.queryLists(ctx, `WHERE shard_id = $1 AND state IN ('ACTIVE', 'FROZEN') ORDER BY created_at ASC`, shardID)
 }
 
-func (m *MetaStore) queryLists(ctx context.Context, whereOrderBy string) ([]*ListMeta, error) {
-	rows, err := m.pool.Query(ctx, `SELECT `+listColumns+` FROM lists `+whereOrderBy)
+func (m *MetaStore) queryLists(ctx context.Context, whereOrderBy string, args ...any) ([]*ListMeta, error) {
+	rows, err := m.pool.Query(ctx, `SELECT `+listColumns+` FROM lists `+whereOrderBy, args...)
 	if err != nil {
 		return nil, fmt.Errorf("store: query lists: %w", err)
 	}
@@ -276,10 +302,13 @@ func (m *MetaStore) MarkPurged(ctx context.Context, listID string) error {
 }
 
 // ReserveCursorAndRecord atomically reserves the next cursor position in
-// a list, bumps max_exp, and records issuer ownership of the resulting
-// index — the three writes an allocation needs, done as one transaction
-// so a crash between them can't leave an orphaned reservation.
-func (m *MetaStore) ReserveCursorAndRecord(ctx context.Context, listID string, issuerID string, exp time.Time, deriveIndex func(cursor uint64) (uint64, error)) (index uint64, err error) {
+// a list, bumps max_exp, records issuer ownership of the resulting
+// index, and increments the issuer's accounting counter for shardID
+// (docs/design.md §15.4 — in the same transaction as the allocation it
+// counts, so it can never drift from reality) — the four writes an
+// allocation needs, done as one transaction so a crash between them
+// can't leave a partial result.
+func (m *MetaStore) ReserveCursorAndRecord(ctx context.Context, listID, issuerID, shardID string, exp time.Time, deriveIndex func(cursor uint64) (uint64, error)) (index uint64, err error) {
 	tx, err := m.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("store: begin tx: %w", err)
@@ -327,6 +356,15 @@ func (m *MetaStore) ReserveCursorAndRecord(ctx context.Context, listID string, i
 		return 0, fmt.Errorf("store: record allocation: %w", err)
 	}
 
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO issuer_usage (issuer_id, shard_id, index_count) VALUES ($1, $2, 1)
+		 ON CONFLICT (issuer_id, shard_id) DO UPDATE
+		   SET index_count = issuer_usage.index_count + 1, updated_at = now()`,
+		issuerID, shardID,
+	); err != nil {
+		return 0, fmt.Errorf("store: increment issuer usage: %w", err)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("store: commit allocation: %w", err)
 	}
@@ -351,4 +389,36 @@ func (m *MetaStore) CheckOwnership(ctx context.Context, listID string, idx uint6
 		return ErrNotOwner
 	}
 	return nil
+}
+
+// Usage is one issuer's index-position count within one shard
+// (docs/design.md §15.4).
+type Usage struct {
+	IssuerID   string
+	ShardID    string
+	IndexCount int64
+	UpdatedAt  time.Time
+}
+
+// GetUsage returns issuerID's accounting rows, one per shard it has ever
+// allocated in.
+func (m *MetaStore) GetUsage(ctx context.Context, issuerID string) ([]Usage, error) {
+	rows, err := m.pool.Query(ctx,
+		`SELECT issuer_id, shard_id, index_count, updated_at FROM issuer_usage WHERE issuer_id = $1 ORDER BY shard_id`,
+		issuerID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: query usage for %s: %w", issuerID, err)
+	}
+	defer rows.Close()
+
+	var out []Usage
+	for rows.Next() {
+		var u Usage
+		if err := rows.Scan(&u.IssuerID, &u.ShardID, &u.IndexCount, &u.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("store: scan usage row: %w", err)
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
 }

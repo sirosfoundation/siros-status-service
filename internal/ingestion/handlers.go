@@ -1,4 +1,4 @@
-package api
+package ingestion
 
 import (
 	"errors"
@@ -29,10 +29,9 @@ type allocateResponse struct {
 // path needing to coordinate with internal/pool's background loop.
 const maxAllocateAttempts = 5
 
-// handleAllocate implements docs/design.md §14 item 3: "a minimal issuer
-// API: POST /allocate ... only the credential's expiration is needed."
-// List selection is §8.1's issuer-blind, power-of-two-choices placement
-// across the ACTIVE pool (internal/pool), not a single fixed list.
+// handleAllocate implements docs/design.md §14 item 3 / §15.1: only the
+// credential's expiration is needed. The caller's issuer identity comes
+// from their verified access token (§15.3), not a request field.
 func (s *Server) handleAllocate(c *gin.Context) {
 	var req allocateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -60,7 +59,7 @@ func (s *Server) handleAllocate(c *gin.Context) {
 			return
 		}
 
-		idx, err := s.meta.ReserveCursorAndRecord(ctx, lm.ID, issuerID, req.Exp, alloc.Index)
+		idx, err := s.meta.ReserveCursorAndRecord(ctx, lm.ID, issuerID, s.cfg.ShardID, req.Exp, alloc.Index)
 		if err != nil {
 			if errors.Is(err, store.ErrListFull) {
 				continue // §8.1: try again against a freshly-queried pool
@@ -89,8 +88,8 @@ var statusNames = map[string]statuslist.Status{
 	"SUSPENDED": statuslist.StatusSuspended,
 }
 
-// handleSetStatus implements the PATCH /status/{listID}/{idx} half of
-// §14 item 3, enforcing the server-side ownership lookup decided in §13.
+// handleSetStatus implements PATCH /status/{listID}/{idx}, enforcing the
+// server-side ownership lookup decided in §13.
 func (s *Server) handleSetStatus(c *gin.Context) {
 	listID := c.Param("listID")
 	idx, err := strconv.ParseUint(c.Param("idx"), 10, 64)
@@ -150,49 +149,26 @@ func (s *Server) handleSetStatus(c *gin.Context) {
 	c.Status(204)
 }
 
-// handleGetList implements the verifier-facing GET, including
-// conditional-request support (docs/design.md §9).
-func (s *Server) handleGetList(c *gin.Context) {
-	listID := c.Param("listID")
-	ctx := c.Request.Context()
+type usageResponse struct {
+	ShardID    string `json:"shard_id"`
+	IndexCount int64  `json:"index_count"`
+}
 
-	lm, err := s.meta.GetList(ctx, listID)
+// handleAccountingMe implements docs/design.md §15.4: self-service usage
+// lookup, scoped to the caller's own issuer identity from their access
+// token — no separate admin auth needed for a number issuers already
+// have every incentive to track honestly.
+func (s *Server) handleAccountingMe(c *gin.Context) {
+	issuerID := issuerFromContext(c)
+	usage, err := s.meta.GetUsage(c.Request.Context(), issuerID)
 	if err != nil {
-		c.JSON(500, gin.H{"error": "lookup failed"})
-		return
-	}
-	if lm == nil {
-		c.JSON(404, gin.H{"error": "list not found"})
-		return
-	}
-	if lm.State == "ARCHIVED" {
-		// docs/design.md §7/§13: keep serving the last-published token
-		// for a retention window after archival (so a verifier that
-		// checks late doesn't hit a dead link out of nowhere), then 410
-		// Gone once that window has elapsed. Within the window this
-		// falls through to the same publish path below — harmless,
-		// since an archived list accepts no further writes (see
-		// handleSetStatus), so PublishIfStale is just a cache hit after
-		// its first rebuild.
-		if lm.ArchivedAt == nil || time.Since(*lm.ArchivedAt) > s.cfg.GCRetentionPeriod {
-			c.JSON(410, gin.H{"error": "this status list has been archived"})
-			return
-		}
-	}
-
-	pub, err := s.pub.PublishIfStale(ctx, lm, s.cfg.DefaultTTLSeconds)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "could not publish list"})
+		c.JSON(500, gin.H{"error": "could not look up usage"})
 		return
 	}
 
-	etag := `"` + strconv.FormatInt(pub.Version, 10) + `"`
-	if match := c.GetHeader("If-None-Match"); match == etag {
-		c.Status(304)
-		return
+	out := make([]usageResponse, 0, len(usage))
+	for _, u := range usage {
+		out = append(out, usageResponse{ShardID: u.ShardID, IndexCount: u.IndexCount})
 	}
-
-	c.Header("ETag", etag)
-	c.Header("Cache-Control", "public, max-age="+strconv.FormatInt(pub.TTL, 10))
-	c.Data(200, "application/statuslist+jwt", []byte(pub.Token))
+	c.JSON(200, gin.H{"issuer_id": issuerID, "usage": out})
 }

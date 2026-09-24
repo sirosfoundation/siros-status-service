@@ -1,7 +1,10 @@
-// Package config loads the prototype's runtime configuration from the
+// Package config loads each binary's runtime configuration from the
 // environment, matching the Fly deployment model in docs/design.md §12
 // (env-based config, no separate config-file convention needed at this
-// scale).
+// scale). Each of the four services (cmd/ingestion-service,
+// cmd/verifier-service, cmd/as, cmd/ingress-router — docs/design.md §15)
+// gets its own focused Load function and struct rather than sharing one
+// config type with fields irrelevant to most of them.
 package config
 
 import (
@@ -12,202 +15,294 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
-type Config struct {
-	// HTTPAddr is the address the API server listens on.
+// IngestionConfig configures cmd/ingestion-service.
+type IngestionConfig struct {
 	HTTPAddr string
 	// BaseURL is this service's own public base URL, used to build
 	// {list_url} values returned from POST /allocate.
 	BaseURL string
 
-	// RedisAddr is a bare host:port, used when no auth/TLS is needed
-	// (e.g. local docker compose). RedisURL, if set, takes precedence and
-	// is a full connection string (redis:// or rediss://) as required by
-	// managed offerings like Fly's Upstash-backed Redis, which need
-	// password auth and TLS — a bare address can't express either.
 	RedisAddr   string
 	RedisURL    string
 	PostgresDSN string
 
-	// ListCapacity is N_max (docs/design.md §7/§8.2): the per-list
-	// capacity internal/pool creates new lists with.
+	// ShardID is which shard (docs/design.md §15.5) this instance owns —
+	// every list it creates, and every access token it will accept,
+	// belongs to this shard.
+	ShardID string
+
+	// ListCapacity is N_max (§7/§8.2): the per-list capacity
+	// internal/pool creates new lists with.
 	ListCapacity uint64
 	// ListBits is the per-entry bit width (1, 2, 4, or 8).
 	ListBits int
 
-	// PoolWidth is K (docs/design.md §8.1/§8.2): the number of
-	// concurrently-ACTIVE lists that power-of-two-choices placement
-	// picks between.
+	// PoolWidth is K (§8.1/§8.2): concurrently-ACTIVE lists that
+	// power-of-two-choices placement picks between.
 	PoolWidth int
-	// RotationMaxAge is T_max (§8.2): the maximum time a list stays
-	// ACTIVE regardless of fill, after which internal/pool freezes it.
-	// Zero disables age-based rotation (fullness, via N_max, still
-	// applies).
+	// RotationMaxAge is T_max (§8.2). Zero disables age-based rotation.
 	RotationMaxAge time.Duration
 	// PoolCheckInterval is how often internal/pool's background loop
-	// checks for lists past RotationMaxAge and tops the pool back up to
-	// PoolWidth (docs/design.md §12: rotation maintenance is a separate,
-	// infrequent background job, not folded into the request path).
+	// checks for lists past RotationMaxAge and tops the pool back up.
 	PoolCheckInterval time.Duration
 
 	// DefaultTTLSeconds is the fallback cache lifetime applied when an
-	// issuer doesn't set its own (docs/design.md §9/§13: ttl is
-	// configurable per issuer/credential type, decided 2026-09-23).
+	// issuer doesn't set its own (§9/§13).
 	DefaultTTLSeconds int64
-
-	// PublishInterval is how often the publisher checks for lists whose
-	// live version has moved past their last-published version
-	// (docs/design.md §9's "debounced" publisher, simplified for the
-	// prototype to a fixed poll interval rather than true debouncing —
-	// see internal/publisher's package doc).
+	// PublishInterval is the periodic-republish backstop interval (§9).
 	PublishInterval time.Duration
 
-	// GCGracePeriod is the buffer past a list's max_exp before internal/gc
-	// archives it (docs/design.md §7 point 4's grace_period) — absorbs
-	// clock skew and the last few genuinely-still-checking verifiers
-	// rather than archiving the instant the nominal expiry passes.
-	GCGracePeriod time.Duration
-	// GCRetentionPeriod is how long an archived list stays servable
-	// (last-published token, no further writes) before internal/api
-	// starts returning 410 and internal/gc drops its Redis bitmap
-	// (docs/design.md §7 point 4 / §13's decided dead-link policy).
+	GCGracePeriod     time.Duration
 	GCRetentionPeriod time.Duration
-	// GCCheckInterval is how often internal/gc sweeps for lists to
-	// archive or purge — infrequent by design (§12), like PoolCheckInterval.
-	GCCheckInterval time.Duration
+	GCCheckInterval   time.Duration
 
 	// SigningKey signs StatusListTokens; SigningKeyID is placed in the
 	// JWS `kid` header.
 	SigningKey   *ecdsa.PrivateKey
 	SigningKeyID string
 
-	// IssuerAPIKeys maps a bearer token to the issuer_id it
-	// authenticates as. This is a deliberately minimal prototype-only
-	// mechanism (docs/design.md doesn't specify issuer onboarding);
-	// production would replace it with OAuth2 client-credentials or
-	// mTLS without touching anything downstream of authentication.
-	IssuerAPIKeys map[string]string
+	// ASJWKSURL, AccessTokenIssuer, and AccessTokenAudience configure
+	// offline access-token verification (§15.3) — the AS is never
+	// called on the request path, only its JWKS is fetched and cached.
+	ASJWKSURL           string
+	AccessTokenIssuer   string
+	AccessTokenAudience string
+	JWKSRefreshInterval time.Duration
 }
 
-// FromEnv loads configuration from environment variables, applying
-// sensible prototype defaults where the design doc doesn't mandate a
-// specific value.
-func FromEnv() (*Config, error) {
-	c := &Config{
-		HTTPAddr:          getEnv("HTTP_ADDR", ":8080"),
-		BaseURL:           getEnv("BASE_URL", "http://localhost:8080"),
-		RedisAddr:         getEnv("REDIS_ADDR", "localhost:6379"),
-		RedisURL:          os.Getenv("REDIS_URL"),
-		PostgresDSN:       getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/statuslist?sslmode=disable"),
-		DefaultTTLSeconds: 3600,
-		ListBits:          2,
-		PublishInterval:   10 * time.Second,
-		SigningKeyID:      getEnv("SIGNING_KEY_ID", "prototype-1"),
-		IssuerAPIKeys:     map[string]string{},
-		PoolWidth:         4,
-		RotationMaxAge:    24 * time.Hour,
-		PoolCheckInterval: 30 * time.Second,
-		GCGracePeriod:     24 * time.Hour,
-		GCRetentionPeriod: 30 * 24 * time.Hour,
-		GCCheckInterval:   time.Hour,
+func LoadIngestion() (*IngestionConfig, error) {
+	c := &IngestionConfig{
+		HTTPAddr:            getEnv("HTTP_ADDR", ":8080"),
+		BaseURL:             getEnv("BASE_URL", "http://localhost:8080"),
+		RedisAddr:           getEnv("REDIS_ADDR", "localhost:6379"),
+		RedisURL:            os.Getenv("REDIS_URL"),
+		PostgresDSN:         getEnv("DATABASE_URL", defaultPostgresDSN),
+		ShardID:             getEnv("SHARD_ID", "default"),
+		ListBits:            2,
+		PoolWidth:           4,
+		RotationMaxAge:      24 * time.Hour,
+		PoolCheckInterval:   30 * time.Second,
+		DefaultTTLSeconds:   3600,
+		PublishInterval:     10 * time.Second,
+		GCGracePeriod:       24 * time.Hour,
+		GCRetentionPeriod:   30 * 24 * time.Hour,
+		GCCheckInterval:     time.Hour,
+		SigningKeyID:        getEnv("SIGNING_KEY_ID", "prototype-1"),
+		AccessTokenIssuer:   os.Getenv("ACCESS_TOKEN_ISSUER"),
+		AccessTokenAudience: getEnv("ACCESS_TOKEN_AUDIENCE", "siros-status-service"),
+		JWKSRefreshInterval: 5 * time.Minute,
+	}
+	var err error
+	if c.ListCapacity, err = getUint64Env("LIST_CAPACITY", 100_000); err != nil {
+		return nil, err
+	}
+	if c.ListBits, err = getIntEnv("LIST_BITS", c.ListBits); err != nil {
+		return nil, err
+	}
+	if c.PoolWidth, err = getIntEnv("POOL_WIDTH", c.PoolWidth); err != nil {
+		return nil, err
+	}
+	if c.RotationMaxAge, err = getDurationEnv("ROTATION_MAX_AGE", c.RotationMaxAge); err != nil {
+		return nil, err
+	}
+	if c.PoolCheckInterval, err = getDurationEnv("POOL_CHECK_INTERVAL", c.PoolCheckInterval); err != nil {
+		return nil, err
+	}
+	if c.DefaultTTLSeconds, err = getInt64Env("DEFAULT_TTL_SECONDS", c.DefaultTTLSeconds); err != nil {
+		return nil, err
+	}
+	if c.PublishInterval, err = getDurationEnv("PUBLISH_INTERVAL", c.PublishInterval); err != nil {
+		return nil, err
+	}
+	if c.GCGracePeriod, err = getDurationEnv("GC_GRACE_PERIOD", c.GCGracePeriod); err != nil {
+		return nil, err
+	}
+	if c.GCRetentionPeriod, err = getDurationEnv("GC_RETENTION_PERIOD", c.GCRetentionPeriod); err != nil {
+		return nil, err
+	}
+	if c.GCCheckInterval, err = getDurationEnv("GC_CHECK_INTERVAL", c.GCCheckInterval); err != nil {
+		return nil, err
+	}
+	if c.JWKSRefreshInterval, err = getDurationEnv("JWKS_REFRESH_INTERVAL", c.JWKSRefreshInterval); err != nil {
+		return nil, err
+	}
+	if c.SigningKey, err = requireECKeyEnv("SIGNING_KEY_PEM"); err != nil {
+		return nil, err
 	}
 
-	if v := os.Getenv("LIST_CAPACITY"); v != "" {
-		n, err := strconv.ParseUint(v, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("config: LIST_CAPACITY: %w", err)
-		}
-		c.ListCapacity = n
-	} else {
-		c.ListCapacity = 100_000
+	c.ASJWKSURL = os.Getenv("AS_JWKS_URL")
+	if c.ASJWKSURL == "" {
+		return nil, fmt.Errorf("config: AS_JWKS_URL is required")
 	}
-
-	if v := os.Getenv("LIST_BITS"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return nil, fmt.Errorf("config: LIST_BITS: %w", err)
-		}
-		c.ListBits = n
+	if c.AccessTokenIssuer == "" {
+		return nil, fmt.Errorf("config: ACCESS_TOKEN_ISSUER is required")
 	}
-
-	if v := os.Getenv("DEFAULT_TTL_SECONDS"); v != "" {
-		n, err := strconv.ParseInt(v, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("config: DEFAULT_TTL_SECONDS: %w", err)
-		}
-		c.DefaultTTLSeconds = n
-	}
-
-	if v := os.Getenv("POOL_WIDTH"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return nil, fmt.Errorf("config: POOL_WIDTH: %w", err)
-		}
-		c.PoolWidth = n
-	}
-
-	if v := os.Getenv("ROTATION_MAX_AGE"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("config: ROTATION_MAX_AGE: %w", err)
-		}
-		c.RotationMaxAge = d
-	}
-
-	if v := os.Getenv("POOL_CHECK_INTERVAL"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("config: POOL_CHECK_INTERVAL: %w", err)
-		}
-		c.PoolCheckInterval = d
-	}
-
-	if v := os.Getenv("GC_GRACE_PERIOD"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("config: GC_GRACE_PERIOD: %w", err)
-		}
-		c.GCGracePeriod = d
-	}
-
-	if v := os.Getenv("GC_RETENTION_PERIOD"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("config: GC_RETENTION_PERIOD: %w", err)
-		}
-		c.GCRetentionPeriod = d
-	}
-
-	if v := os.Getenv("GC_CHECK_INTERVAL"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("config: GC_CHECK_INTERVAL: %w", err)
-		}
-		c.GCCheckInterval = d
-	}
-
-	keyPEM := os.Getenv("SIGNING_KEY_PEM")
-	if keyPEM == "" {
-		return nil, fmt.Errorf("config: SIGNING_KEY_PEM is required (PEM-encoded EC private key, P-256)")
-	}
-	key, err := parseECKey(keyPEM)
-	if err != nil {
-		return nil, fmt.Errorf("config: SIGNING_KEY_PEM: %w", err)
-	}
-	c.SigningKey = key
-
-	if v := os.Getenv("ISSUER_API_KEYS"); v != "" {
-		var m map[string]string
-		if err := json.Unmarshal([]byte(v), &m); err != nil {
-			return nil, fmt.Errorf("config: ISSUER_API_KEYS must be a JSON object of token->issuer_id: %w", err)
-		}
-		c.IssuerAPIKeys = m
-	}
-
 	return c, nil
 }
+
+// VerifierConfig configures cmd/verifier-service.
+type VerifierConfig struct {
+	HTTPAddr    string
+	BaseURL     string
+	PostgresDSN string
+
+	// ShardRedisURLs maps shard_id -> that shard's Redis connection
+	// string, since a verifier may need to read any shard's bitmap
+	// depending on which shard a requested list belongs to (§15.5).
+	ShardRedisURLs map[string]string
+
+	DefaultTTLSeconds int64
+	// GCRetentionPeriod must match the ingestion shards' own setting —
+	// it's how the verifier decides whether an ARCHIVED list is still
+	// within its serve-the-last-token window or should now 410 (§7 point
+	// 4, §13). GC itself (archiving, purging) still runs only on the
+	// ingestion side (internal/gc); the verifier only reads this value.
+	GCRetentionPeriod time.Duration
+
+	SigningKey   *ecdsa.PrivateKey
+	SigningKeyID string
+}
+
+func LoadVerifier() (*VerifierConfig, error) {
+	c := &VerifierConfig{
+		HTTPAddr:          getEnv("HTTP_ADDR", ":8081"),
+		BaseURL:           getEnv("BASE_URL", "http://localhost:8081"),
+		PostgresDSN:       getEnv("DATABASE_URL", defaultPostgresDSN),
+		DefaultTTLSeconds: 3600,
+		GCRetentionPeriod: 30 * 24 * time.Hour,
+		SigningKeyID:      getEnv("SIGNING_KEY_ID", "prototype-1"),
+	}
+	var err error
+	if c.DefaultTTLSeconds, err = getInt64Env("DEFAULT_TTL_SECONDS", c.DefaultTTLSeconds); err != nil {
+		return nil, err
+	}
+	if c.GCRetentionPeriod, err = getDurationEnv("GC_RETENTION_PERIOD", c.GCRetentionPeriod); err != nil {
+		return nil, err
+	}
+	if c.SigningKey, err = requireECKeyEnv("SIGNING_KEY_PEM"); err != nil {
+		return nil, err
+	}
+
+	raw := os.Getenv("SHARD_REDIS_URLS")
+	if raw == "" {
+		return nil, fmt.Errorf("config: SHARD_REDIS_URLS is required (JSON object of shard_id -> redis URL)")
+	}
+	if err := json.Unmarshal([]byte(raw), &c.ShardRedisURLs); err != nil {
+		return nil, fmt.Errorf("config: SHARD_REDIS_URLS: %w", err)
+	}
+	return c, nil
+}
+
+// ASConfig configures cmd/as, the Authorization Server (§15.2).
+type ASConfig struct {
+	HTTPAddr string
+	// BaseURL is the AS's own public base URL — both the `iss` claim on
+	// minted tokens and the expected `aud` on inbound client assertions.
+	BaseURL string
+
+	PostgresDSN string
+
+	// SigningKey signs access tokens; deliberately distinct from the
+	// StatusListToken signing key (different service, different trust
+	// boundary — see docs/design.md §15.8).
+	SigningKey   *ecdsa.PrivateKey
+	SigningKeyID string
+
+	AccessTokenTTL      time.Duration
+	AccessTokenAudience string
+
+	// Shards is the pool of shard IDs new issuers get round-robin
+	// assigned into on first token issuance (§15.5).
+	Shards []string
+
+	// TrustPDPURL, if set, enables the AuthZENEvaluator (§15.2) as an
+	// additional trust source alongside the static registry. Empty
+	// disables it — no live PDP is required to run this service.
+	TrustPDPURL     string
+	TrustActionName string
+
+	// AdminToken gates the issuer-registration endpoint (§15.8: "no
+	// self-service flow yet" — this is the admin operation).
+	AdminToken string
+}
+
+func LoadAS() (*ASConfig, error) {
+	c := &ASConfig{
+		HTTPAddr:            getEnv("HTTP_ADDR", ":8082"),
+		BaseURL:             getEnv("BASE_URL", "http://localhost:8082"),
+		PostgresDSN:         getEnv("DATABASE_URL", defaultPostgresDSN),
+		SigningKeyID:        getEnv("SIGNING_KEY_ID", "as-prototype-1"),
+		AccessTokenTTL:      time.Hour,
+		AccessTokenAudience: getEnv("ACCESS_TOKEN_AUDIENCE", "siros-status-service"),
+		TrustPDPURL:         os.Getenv("TRUST_PDP_URL"),
+		TrustActionName:     os.Getenv("TRUST_ACTION_NAME"),
+		AdminToken:          os.Getenv("ADMIN_TOKEN"),
+	}
+	var err error
+	if c.AccessTokenTTL, err = getDurationEnv("ACCESS_TOKEN_TTL", c.AccessTokenTTL); err != nil {
+		return nil, err
+	}
+	if c.SigningKey, err = requireECKeyEnv("AS_SIGNING_KEY_PEM"); err != nil {
+		return nil, err
+	}
+
+	shards := getEnv("SHARDS", "default")
+	c.Shards = strings.Split(shards, ",")
+	if c.AdminToken == "" {
+		return nil, fmt.Errorf("config: ADMIN_TOKEN is required (gates the issuer-registration endpoint)")
+	}
+	return c, nil
+}
+
+// IngressConfig configures cmd/ingress-router (§15.6).
+type IngressConfig struct {
+	HTTPAddr string
+
+	ASJWKSURL           string
+	AccessTokenIssuer   string
+	AccessTokenAudience string
+	JWKSRefreshInterval time.Duration
+
+	// ShardBackends maps shard_id -> that shard's ingestion-service base
+	// URL, read from the access token's shard claim per request.
+	ShardBackends map[string]string
+}
+
+func LoadIngress() (*IngressConfig, error) {
+	c := &IngressConfig{
+		HTTPAddr:            getEnv("HTTP_ADDR", ":8083"),
+		AccessTokenAudience: getEnv("ACCESS_TOKEN_AUDIENCE", "siros-status-service"),
+		JWKSRefreshInterval: 5 * time.Minute,
+	}
+	var err error
+	if c.JWKSRefreshInterval, err = getDurationEnv("JWKS_REFRESH_INTERVAL", c.JWKSRefreshInterval); err != nil {
+		return nil, err
+	}
+
+	c.ASJWKSURL = os.Getenv("AS_JWKS_URL")
+	if c.ASJWKSURL == "" {
+		return nil, fmt.Errorf("config: AS_JWKS_URL is required")
+	}
+	c.AccessTokenIssuer = os.Getenv("ACCESS_TOKEN_ISSUER")
+	if c.AccessTokenIssuer == "" {
+		return nil, fmt.Errorf("config: ACCESS_TOKEN_ISSUER is required")
+	}
+
+	raw := os.Getenv("SHARD_BACKENDS")
+	if raw == "" {
+		return nil, fmt.Errorf("config: SHARD_BACKENDS is required (JSON object of shard_id -> backend base URL)")
+	}
+	if err := json.Unmarshal([]byte(raw), &c.ShardBackends); err != nil {
+		return nil, fmt.Errorf("config: SHARD_BACKENDS: %w", err)
+	}
+	return c, nil
+}
+
+const defaultPostgresDSN = "postgres://postgres:postgres@localhost:5432/statuslist?sslmode=disable"
 
 func getEnv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -216,14 +311,66 @@ func getEnv(key, def string) string {
 	return def
 }
 
-func parseECKey(pemStr string) (*ecdsa.PrivateKey, error) {
+func getIntEnv(key string, def int) (int, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s: %w", key, err)
+	}
+	return n, nil
+}
+
+func getInt64Env(key string, def int64) (int64, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s: %w", key, err)
+	}
+	return n, nil
+}
+
+func getUint64Env(key string, def uint64) (uint64, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.ParseUint(v, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s: %w", key, err)
+	}
+	return n, nil
+}
+
+func getDurationEnv(key string, def time.Duration) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s: %w", key, err)
+	}
+	return d, nil
+}
+
+func requireECKeyEnv(key string) (*ecdsa.PrivateKey, error) {
+	pemStr := os.Getenv(key)
+	if pemStr == "" {
+		return nil, fmt.Errorf("config: %s is required (PEM-encoded EC private key, P-256)", key)
+	}
 	block, _ := pem.Decode([]byte(pemStr))
 	if block == nil {
-		return nil, fmt.Errorf("no PEM block found")
+		return nil, fmt.Errorf("config: %s: no PEM block found", key)
 	}
-	key, err := x509.ParseECPrivateKey(block.Bytes)
+	k, err := x509.ParseECPrivateKey(block.Bytes)
 	if err != nil {
-		return nil, fmt.Errorf("parse EC private key: %w", err)
+		return nil, fmt.Errorf("config: %s: parse EC private key: %w", key, err)
 	}
-	return key, nil
+	return k, nil
 }

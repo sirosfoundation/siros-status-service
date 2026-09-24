@@ -5,106 +5,201 @@ A standalone status list service for digital credentials, implementing
 (Token Status List). See [`docs/design.md`](docs/design.md) for the full
 design and rationale.
 
-**Status:** prototype (docs/design.md §14). This validates the core
-claims end to end: the keyed FPE index allocator, spec-conformant
+**Status:** prototype (docs/design.md §14–§15). Core list mechanics are
+proven end to end: the keyed FPE index allocator, spec-conformant
 bit-packing, the allocate/update/publish/cache loop, real rotation on
-both fullness (N_max) and age (T_max), the §8.1 issuer-blind,
-power-of-two-choices distribution pool across K concurrently-ACTIVE
-lists, the §7 point 4 GC/archival sweeper (archive on expiry + grace,
-purge on retention, 410 after that), and §9's debounced publisher
-(publish immediately if idle, coalesce a burst into one deferred publish
-otherwise). The finer §8.2/§8.3 controls are deliberately not yet
-implemented; see "Known gaps" below.
+both fullness and age, the issuer-blind power-of-two-choices distribution
+pool, the GC/archival sweeper, and the debounced publisher. On top of
+that, §15 splits the service into four cooperating binaries with real
+issuer authentication (client-assertion + trust evaluation), offline
+JWT verification, sharding, and JWT-based ingress routing — also proven
+end to end against real Postgres/Redis with two live shards.
 
 ## Architecture
 
-- `internal/allocator` — the keyed format-preserving permutation from
-  §5A: derives a pseudorandom, collision-free index for each new
-  allocation without storing a permutation array.
-- `internal/statuslist` — pure spec logic: bit-packing status values
-  (§4.1), DEFLATE/zlib + base64url encoding (§4.2), and building/parsing
-  the signed Status List Token (§5.1). Verified against the draft's own
-  worked byte-array examples.
-- `internal/store` — Postgres for list/allocation-ownership metadata,
-  Redis for the hot status bitmap. See the package doc in
-  `internal/store/redis.go` for why this does **not** use Redis's
-  `BITFIELD` field-addressing directly (its bit numbering is MSB-first;
-  the spec packs LSB-first) — it does an atomic whole-byte
-  read-modify-write via a small Lua script instead.
-- `internal/publisher` — rebuilds and signs a fresh StatusListToken when
-  a list's live version has moved past what was last published. Two paths
-  call the same idempotent rebuild: `MarkDirty`, triggered right after a
-  status write, implements §9's debounce literally — publish immediately
-  if idle, or coalesce a burst of writes into one deferred publish timed
-  for when the list's own `ttl` window reopens (`debounce.go`'s
-  `leadingDebouncer`, pure and unit-tested in isolation) — and a periodic
-  poll (`Run`) that now serves only as a backstop. Also publishes every
-  ACTIVE and FROZEN list (§7 point 3: a frozen list still accepts status
-  updates until it's archived).
-- `internal/pool` — §8's distribution: keeps a pool of `PoolWidth` (K)
-  concurrently-ACTIVE lists healthy (freezing any past `RotationMaxAge`
-  — T_max — and topping the pool back up), and picks a target list for
-  each allocation via issuer-blind power-of-two-choices (§8.1). Fullness
-  rotation (N_max) is enforced atomically inside
-  `store.ReserveCursorAndRecord`'s own `UPDATE`, so a list flips to
-  FROZEN in the same statement that fills its last slot.
-- `internal/api` — the issuer-facing `POST /allocate` / `PATCH /status`
-  and the verifier-facing `GET /lists/{id}` (with ETag/conditional-GET
-  support). `POST /allocate` retries against a freshly-queried pool if
-  the list it picked got filled or frozen by a concurrent request first.
-  `PATCH /status` rejects writes to an ARCHIVED list; `GET` keeps serving
-  an ARCHIVED list's last-published token through its retention window,
-  then returns `410`.
-- `internal/gc` — the archive/purge sweep (§7 point 4): FROZEN lists past
-  `max_exp + GCGracePeriod` become ARCHIVED; ARCHIVED lists past
-  `archived_at + GCRetentionPeriod` have their Redis bitmap dropped. A
-  separate background loop, like `internal/pool`'s rotation maintenance.
+Four services (docs/design.md §15), each its own binary under `cmd/`:
+
+- **`cmd/as`** (`internal/as`) — the Authorization Server. An issuer
+  proves possession of their signing key via a self-signed client
+  assertion (`internal/clientassertion`, RFC 7523-flavored, embedded
+  `jwk` header — no pre-registration URL needed); a `trust.Evaluator`
+  decides whether that key is trusted (`internal/trust`: a
+  Postgres-backed `StaticRegistryEvaluator` by default, or a real
+  AuthZEN-wire-protocol `AuthZENEvaluator` against a go-trust PDP if
+  `TRUST_PDP_URL` is set); on success, mints an access token shaped as
+  `go-tokenauth/claims.AccessTokenClaims` (`internal/accesstoken`),
+  assigning the issuer to a shard on first request
+  (`internal/as/shard.go`, sticky thereafter).
+- **`cmd/ingestion-service`** (`internal/ingestion`) — issuer-facing:
+  `POST /allocate`, `PATCH /status/{listID}/{idx}`,
+  `GET /accounting/me`. One process = one shard. Verifies access tokens
+  fully offline using **`go-tokenauth`'s real `validator`/`jwks`/
+  `tokengin` packages** (not a local reimplementation — see design doc
+  §15.2 for why), enforces per-route permissions via its `tac` claim,
+  and rejects a token whose `tenant_id` (shard) doesn't match this
+  instance's own as defense in depth.
+- **`cmd/verifier-service`** (`internal/verifier`) — read-only,
+  unauthenticated: `GET /lists/{id}`. A single instance can serve any
+  shard's lists — it looks up `shard_id` from the shared Postgres row
+  and holds one Redis client per shard (`SHARD_REDIS_URLS`).
+- **`cmd/ingress-router`** (`internal/ingress`) — sits in front of the
+  ingestion farm. Verifies the caller's token the same way (offline,
+  `go-tokenauth`), reads its `tenant_id`, and reverse-proxies to that
+  shard's configured backend. Issuers only ever see one router URL.
+
+Shared packages:
+
+- `internal/allocator` — the keyed format-preserving permutation
+  (§5A): a pseudorandom, collision-free index per allocation, no stored
+  permutation array.
+- `internal/statuslist` — pure spec logic: bit-packing (§4.1),
+  DEFLATE/zlib + base64url encoding (§4.2), the signed Status List
+  Token (§5.1). Verified against the draft's own worked byte-array
+  examples.
+- `internal/store` — Postgres for list/allocation/accounting metadata
+  (shared across shards, `shard_id`-scoped queries), Redis for the hot
+  status bitmap (one instance per shard). See `internal/store/redis.go`
+  for why this does **not** use Redis's `BITFIELD` field-addressing
+  directly (its bit numbering is MSB-first; the spec packs LSB-first) —
+  a small Lua script does an atomic whole-byte read-modify-write
+  instead.
+- `internal/publisher` — rebuilds and signs a fresh StatusListToken
+  when a list's live version moves past what was cached. `MarkDirty`
+  (called right after a write) implements the debounce described in §9
+  literally: publish immediately if idle, coalesce a burst into one
+  deferred publish otherwise; a periodic `Run` loop is a backstop.
+  Shard-aware — takes a `shard_id -> BitmapStore` map, since
+  `cmd/verifier-service` may need any shard's bitmap.
+- `internal/pool` — the §8 distribution: keeps a shard's pool of
+  `PoolWidth` (K) concurrently-ACTIVE lists healthy, picks a target via
+  issuer-blind power-of-two-choices. Fullness rotation is atomic inside
+  `store.ReserveCursorAndRecord`'s own `UPDATE`.
+- `internal/gc` — the archive/purge sweep (§7 point 4).
+- `internal/pgutil` — `ApplySchema`, an advisory-locked DDL helper.
+  **Found live**: two `ingestion-service` shards sharing one Postgres
+  and starting concurrently hit a genuine Postgres catalog race running
+  the same `CREATE TABLE IF NOT EXISTS` at once; this closes it.
 
 ## Running locally
 
+Needs Postgres, two Redis instances (one per shard, to exercise
+sharding for real — a single shard works too), and three EC (P-256)
+signing keys: one for the AS, one shared by ingestion+verifier for
+StatusListTokens (they must match — both sides sign/verify the same
+token type), and one for a test issuer.
+
 ```sh
-make dev-up                                                    # Redis + Postgres via docker compose
-export SIGNING_KEY_PEM="$(openssl ecparam -name prime256v1 -genkey -noout)"
-export ISSUER_API_KEYS='{"some-token":"issuer-a"}'
-make run
+make dev-up   # Postgres + Redis via docker compose (see compose.yaml for shard-b, add a second Redis for real sharding)
+
+export AS_SIGNING_KEY_PEM="$(openssl ecparam -name prime256v1 -genkey -noout)"
+export STATUSLIST_SIGNING_KEY_PEM="$(openssl ecparam -name prime256v1 -genkey -noout)"
+export ISSUER_KEY_PEM="$(openssl ecparam -name prime256v1 -genkey -noout)"
+
+# 1. AS
+DATABASE_URL=... BASE_URL=http://localhost:8090 HTTP_ADDR=:8090 \
+  AS_SIGNING_KEY_PEM="$AS_SIGNING_KEY_PEM" ADMIN_TOKEN=admin-secret SHARDS=shard-a \
+  go run ./cmd/as &
+
+# 2. ingestion-service (shard-a)
+DATABASE_URL=... BASE_URL=http://localhost:8080 HTTP_ADDR=:8091 \
+  SHARD_ID=shard-a REDIS_ADDR=localhost:6379 SIGNING_KEY_PEM="$STATUSLIST_SIGNING_KEY_PEM" \
+  AS_JWKS_URL=http://localhost:8090/.well-known/jwks.json ACCESS_TOKEN_ISSUER=http://localhost:8090 \
+  go run ./cmd/ingestion-service &
+
+# 3. verifier-service
+DATABASE_URL=... BASE_URL=http://localhost:8080 HTTP_ADDR=:8093 \
+  SIGNING_KEY_PEM="$STATUSLIST_SIGNING_KEY_PEM" \
+  SHARD_REDIS_URLS='{"shard-a":"redis://localhost:6379"}' \
+  go run ./cmd/verifier-service &
+
+# 4. ingress-router
+AS_JWKS_URL=http://localhost:8090/.well-known/jwks.json ACCESS_TOKEN_ISSUER=http://localhost:8090 \
+  HTTP_ADDR=:8094 SHARD_BACKENDS='{"shard-a":"http://localhost:8091"}' \
+  go run ./cmd/ingress-router &
 ```
 
-Then:
+Then, as an issuer: register your key (admin operation, §15.8), get a
+token, and use it through the router.
 
 ```sh
-curl -X POST localhost:8080/allocate \
-  -H "Authorization: Bearer some-token" -H "Content-Type: application/json" \
-  -d '{"exp":"2027-01-01T00:00:00Z"}'
-# => {"list_url":"http://localhost:8080/lists/<id>","index":<n>}
+# JWK + a self-signed client assertion (embedded jwk header) — see
+# internal/clientassertion's tests for the exact construction; any small
+# script using go-jose + golang-jwt/v5 as shown there works.
 
-curl -X PATCH localhost:8080/status/<id>/<n> \
-  -H "Authorization: Bearer some-token" -H "Content-Type: application/json" \
-  -d '{"status":"INVALID"}'
+curl -X POST localhost:8090/admin/issuers -H "Authorization: Bearer admin-secret" \
+  -H "Content-Type: application/json" -d "{\"issuer_id\":\"issuer-a\",\"jwk\":$ISSUER_JWK}"
 
-curl localhost:8080/lists/<id>   # the signed StatusListToken (JWT)
+curl -X POST localhost:8090/token \
+  --data-urlencode grant_type=client_credentials \
+  --data-urlencode client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer \
+  --data-urlencode "client_assertion=$ASSERTION"
+# => {"access_token":"...","token_type":"Bearer","expires_in":3600}
+
+curl -X POST localhost:8094/allocate -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" -d '{"exp":"2027-01-01T00:00:00Z"}'
+# => {"list_url":"http://localhost:8080/lists/<id>","index":<n>}   -- routed to shard-a automatically
+
+curl -X PATCH "localhost:8094/status/<id>/<n>" -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" -d '{"status":"INVALID"}'
+
+curl localhost:8093/lists/<id>   # verifier-service, no auth — the signed StatusListToken (JWT)
 ```
 
 ## Configuration (environment variables)
 
+Common to every binary: `HTTP_ADDR`, `BASE_URL`, `DATABASE_URL`.
+
+**`cmd/as`**
+
 | Variable | Default | Notes |
 |---|---|---|
-| `HTTP_ADDR` | `:8080` | |
-| `BASE_URL` | `http://localhost:8080` | used to build `list_url` values |
-| `REDIS_ADDR` | `localhost:6379` | bare host:port, for unauthenticated/local Redis |
-| `REDIS_URL` | *(unset)* | full `redis://`/`rediss://` URL; takes precedence over `REDIS_ADDR`, required for managed Redis (e.g. Fly's Upstash-backed offering) which needs password auth + TLS |
-| `DATABASE_URL` | `postgres://postgres:postgres@localhost:5432/statuslist?sslmode=disable` | |
-| `LIST_CAPACITY` | `100000` | N_max, per docs/design.md §7/§8.2 |
+| `AS_SIGNING_KEY_PEM` | *(required)* | the AS's own token-signing key — distinct from the StatusListToken key |
+| `SIGNING_KEY_ID` | `as-prototype-1` | JWS `kid` for the AS's key |
+| `SHARDS` | `default` | comma-separated shard IDs new issuers round-robin/hash-assign into (§15.5) |
+| `ACCESS_TOKEN_TTL` | `1h` | |
+| `ACCESS_TOKEN_AUDIENCE` | `siros-status-service` | |
+| `ADMIN_TOKEN` | *(required)* | gates `POST /admin/issuers` (§15.8: no self-service registration yet) |
+| `TRUST_PDP_URL` | *(unset)* | if set, also tries a real AuthZEN PDP alongside the static registry |
+| `TRUST_ACTION_NAME` | *(unset)* | AuthZEN `action.name` sent with PDP evaluations |
+
+**`cmd/ingestion-service`**
+
+| Variable | Default | Notes |
+|---|---|---|
+| `SHARD_ID` | `default` | which shard this instance owns |
+| `REDIS_ADDR` / `REDIS_URL` | `localhost:6379` / unset | this shard's Redis |
+| `SIGNING_KEY_PEM` | *(required)* | StatusListToken key — must match `verifier-service`'s |
+| `AS_JWKS_URL` | *(required)* | e.g. `http://as:8090/.well-known/jwks.json` |
+| `ACCESS_TOKEN_ISSUER` | *(required)* | must equal the AS's `BASE_URL` |
+| `ACCESS_TOKEN_AUDIENCE` | `siros-status-service` | |
+| `LIST_CAPACITY` | `100000` | N_max (§7/§8.2) |
 | `LIST_BITS` | `2` | 1, 2, 4, or 8 |
-| `POOL_WIDTH` | `4` | K, per §8.1/§8.2 — concurrently-ACTIVE lists |
-| `ROTATION_MAX_AGE` | `24h` | T_max, per §8.2 — 0 disables age-based rotation |
-| `POOL_CHECK_INTERVAL` | `30s` | how often `internal/pool` checks for stale/missing lists |
-| `GC_GRACE_PERIOD` | `24h` | buffer past a list's `max_exp` before archiving, per §7 point 4 |
-| `GC_RETENTION_PERIOD` | `720h` (30d) | how long an archived list stays servable before `410`/purge |
-| `GC_CHECK_INTERVAL` | `1h` | how often `internal/gc` sweeps for lists to archive/purge |
+| `POOL_WIDTH` | `4` | K (§8.1/§8.2) |
+| `ROTATION_MAX_AGE` | `24h` | T_max — 0 disables age-based rotation |
+| `POOL_CHECK_INTERVAL` | `30s` | |
+| `GC_GRACE_PERIOD` | `24h` | |
+| `GC_RETENTION_PERIOD` | `720h` (30d) | |
+| `GC_CHECK_INTERVAL` | `1h` | |
 | `DEFAULT_TTL_SECONDS` | `3600` | see "Known gaps" re: per-issuer ttl |
-| `SIGNING_KEY_PEM` | *(required)* | PEM-encoded EC (P-256) private key |
-| `SIGNING_KEY_ID` | `prototype-1` | JWS `kid` header |
-| `ISSUER_API_KEYS` | `{}` | JSON object mapping bearer token → issuer_id (prototype-only auth, see `internal/config`'s package doc). **Left empty, auth is skipped entirely** and every caller shares the `anonymous` issuer_id — convenient for a quick test deployment, not a real multi-tenancy boundary. |
+| `PUBLISH_INTERVAL` | `10s` | backstop poll interval (§9) |
+
+**`cmd/verifier-service`**
+
+| Variable | Default | Notes |
+|---|---|---|
+| `SHARD_REDIS_URLS` | *(required)* | JSON object, `shard_id -> redis URL`, one entry per shard this instance can serve |
+| `SIGNING_KEY_PEM` | *(required)* | must match `ingestion-service`'s |
+| `DEFAULT_TTL_SECONDS` | `3600` | |
+| `GC_RETENTION_PERIOD` | `720h` | must match ingestion's — governs the archived-list 410 cutoff |
+
+**`cmd/ingress-router`**
+
+| Variable | Default | Notes |
+|---|---|---|
+| `AS_JWKS_URL` | *(required)* | |
+| `ACCESS_TOKEN_ISSUER` | *(required)* | |
+| `ACCESS_TOKEN_AUDIENCE` | `siros-status-service` | |
+| `SHARD_BACKENDS` | *(required)* | JSON object, `shard_id -> ingestion-service base URL` |
 
 ## Known gaps vs. the full design
 
@@ -112,30 +207,28 @@ These are intentionally deferred, not oversights:
 
 - **GC row cleanup**: `internal/gc` drops a list's Redis bitmap once past
   retention, but its Postgres row (metadata + ownership records) is kept
-  indefinitely — needed to keep serving `410` correctly and for audit
-  history. Revisit only if that metadata's own storage becomes worth
-  reclaiming.
-- **Expiry-bucketed pools (§8.3)**: not implemented — a single pool
-  mixes credentials of any expiration horizon, so a long-lived outlier
-  can drag out a list's effective anonymity-set decay the way §8.3
-  describes. Needs real traffic data to size buckets sensibly.
-- **Target-based rotation knob (§8.2)**: only the raw knobs
-  (`LIST_CAPACITY`/`ROTATION_MAX_AGE`/`POOL_WIDTH`) exist; the
-  throughput-derived "minimum anonymity set + max interval" surface
-  decided as the eventual admin-facing knob is not built.
-- **Per-issuer/credential-type `ttl`**: decided in §13, but only really
-  meaningful once §8.3's expiry-bucketed pools exist, so each pool
-  corresponds to a consistent population that could reasonably share a
-  ttl policy. Right now there's one `ttl` for everyone
-  (`DEFAULT_TTL_SECONDS`).
-- **Issuer authentication**: a static bearer-token map, not OAuth2
-  client-credentials or mTLS. Fine for a prototype, not for onboarding
-  real issuers.
+  indefinitely — needed for `410` semantics and audit history. Revisit
+  only if that metadata's own storage becomes worth reclaiming.
+- **Expiry-bucketed pools (§8.3)**: not implemented — needs real
+  traffic data to size buckets sensibly.
+- **Target-based rotation knob (§8.2)**: only the raw knobs exist; the
+  throughput-derived auto-tuning surface is not built.
+- **Per-issuer/credential-type `ttl`**: still one config value per
+  ingestion instance, not per issuer/type — only really meaningful once
+  §8.3's expiry-bucketed pools exist.
+- **AuthZEN trust evaluation is untested against a live PDP**: the wire
+  client (`internal/trust.AuthZENEvaluator`) is real, but no go-trust
+  PDP is deployed for this service yet (see design doc §15.2 for why
+  importing go-trust's own Go client wasn't the right move either).
+- **Sharding is logical, not physical**: multiple processes/Redis
+  instances, not separate infrastructure/regions.
+- **AS key rotation**: a single static key, not a rotating set.
+- **Issuer registration is admin-only**: `POST /admin/issuers` has no
+  self-service flow.
 - **Pool maintenance has no cross-process lock**: `internal/pool`'s
-  "count ACTIVE lists, then create more if under Width" isn't wrapped in
-  an advisory lock, so a transient overshoot above `POOL_WIDTH` is
-  possible under a race. Harmless at prototype scale (see the package
-  doc); worth hardening only if that stops being true.
+  "count ACTIVE lists, then create more if under Width" can transiently
+  overshoot `POOL_WIDTH` under a race. Harmless at prototype scale (see
+  the package doc).
 
 ## Verified against the spec
 

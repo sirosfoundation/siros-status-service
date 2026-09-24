@@ -56,6 +56,7 @@ func ChooseByPowerOfTwo(candidates []*store.ListMeta, r *mathrand.Rand) *store.L
 type Manager struct {
 	meta     *store.MetaStore
 	bitmaps  *store.BitmapStore
+	ShardID  string // which shard this Manager owns (docs/design.md §15.5)
 	Width    int    // K
 	Capacity uint64 // N_max, per new list
 	Bits     int
@@ -64,10 +65,11 @@ type Manager struct {
 	rand *mathrand.Rand
 }
 
-func NewManager(meta *store.MetaStore, bitmaps *store.BitmapStore, width int, capacity uint64, bits int, maxAge time.Duration) *Manager {
+func NewManager(meta *store.MetaStore, bitmaps *store.BitmapStore, shardID string, width int, capacity uint64, bits int, maxAge time.Duration) *Manager {
 	return &Manager{
 		meta:     meta,
 		bitmaps:  bitmaps,
+		ShardID:  shardID,
 		Width:    width,
 		Capacity: capacity,
 		Bits:     bits,
@@ -88,7 +90,7 @@ func NewManager(meta *store.MetaStore, bitmaps *store.BitmapStore, width int, ca
 // they age out or fill up like any other pool member). Worth revisiting
 // with an advisory lock only if this stops being true at higher scale.
 func (m *Manager) EnsureHealthy(ctx context.Context) error {
-	active, err := m.meta.ActiveLists(ctx)
+	active, err := m.meta.ActiveLists(ctx, m.ShardID)
 	if err != nil {
 		return err
 	}
@@ -124,7 +126,7 @@ func (m *Manager) createList(ctx context.Context) (*store.ListMeta, error) {
 	if err != nil {
 		return nil, err
 	}
-	lm, err := m.meta.CreateList(ctx, id, m.Bits, m.Capacity, key)
+	lm, err := m.meta.CreateList(ctx, id, m.Bits, m.Capacity, key, m.ShardID)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +143,7 @@ func (m *Manager) createList(ctx context.Context) (*store.ListMeta, error) {
 // on first startup, before Run's first tick) rather than making the
 // caller wait for the background loop.
 func (m *Manager) PickForAllocation(ctx context.Context) (*store.ListMeta, error) {
-	active, err := m.meta.ActiveLists(ctx)
+	active, err := m.meta.ActiveLists(ctx, m.ShardID)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +151,7 @@ func (m *Manager) PickForAllocation(ctx context.Context) (*store.ListMeta, error
 		if err := m.EnsureHealthy(ctx); err != nil {
 			return nil, err
 		}
-		active, err = m.meta.ActiveLists(ctx)
+		active, err = m.meta.ActiveLists(ctx, m.ShardID)
 		if err != nil {
 			return nil, err
 		}

@@ -43,11 +43,16 @@ type Published struct {
 }
 
 type Publisher struct {
-	bitmaps *store.BitmapStore
-	meta    *store.MetaStore
-	key     *ecdsa.PrivateKey
-	keyID   string
-	baseURL string
+	// bitmapsByShard maps shard_id -> that shard's Redis-backed bitmap
+	// store (docs/design.md §15.5). An ingestion service (single shard)
+	// passes a one-entry map; a verifier service passes one entry per
+	// shard it serves, since a single verifier may need to read any
+	// shard's bitmap depending on which shard a given list belongs to.
+	bitmapsByShard map[string]*store.BitmapStore
+	meta           *store.MetaStore
+	key            *ecdsa.PrivateKey
+	keyID          string
+	baseURL        string
 
 	mu    sync.RWMutex
 	cache map[string]*Published
@@ -55,15 +60,15 @@ type Publisher struct {
 	debounce *leadingDebouncer
 }
 
-func New(bitmaps *store.BitmapStore, meta *store.MetaStore, key *ecdsa.PrivateKey, keyID, baseURL string) *Publisher {
+func New(bitmapsByShard map[string]*store.BitmapStore, meta *store.MetaStore, key *ecdsa.PrivateKey, keyID, baseURL string) *Publisher {
 	return &Publisher{
-		bitmaps:  bitmaps,
-		meta:     meta,
-		key:      key,
-		keyID:    keyID,
-		baseURL:  baseURL,
-		cache:    make(map[string]*Published),
-		debounce: newLeadingDebouncer(),
+		bitmapsByShard: bitmapsByShard,
+		meta:           meta,
+		key:            key,
+		keyID:          keyID,
+		baseURL:        baseURL,
+		cache:          make(map[string]*Published),
+		debounce:       newLeadingDebouncer(),
 	}
 }
 
@@ -109,20 +114,25 @@ func (p *Publisher) Get(listID string) (*Published, bool) {
 // published yet). ttlSeconds is the per-list/issuer cache lifetime to
 // embed in the token (docs/design.md §9/§13).
 func (p *Publisher) PublishIfStale(ctx context.Context, lm *store.ListMeta, ttlSeconds int64) (*Published, error) {
-	liveVersion, err := p.bitmaps.Version(ctx, lm.ID)
+	bitmaps, ok := p.bitmapsByShard[lm.ShardID]
+	if !ok {
+		return nil, fmt.Errorf("publisher: no bitmap store configured for shard %q (list %s)", lm.ShardID, lm.ID)
+	}
+
+	liveVersion, err := bitmaps.Version(ctx, lm.ID)
 	if err != nil {
 		return nil, err
 	}
 
 	p.mu.RLock()
-	cached, ok := p.cache[lm.ID]
+	cached, cacheOK := p.cache[lm.ID]
 	p.mu.RUnlock()
-	if ok && cached.Version == liveVersion && cached.TTL == ttlSeconds {
+	if cacheOK && cached.Version == liveVersion && cached.TTL == ttlSeconds {
 		return cached, nil
 	}
 
 	byteLen := int64((lm.Size*uint64(lm.Bits) + 7) / 8)
-	raw, err := p.bitmaps.Snapshot(ctx, lm.ID, byteLen)
+	raw, err := bitmaps.Snapshot(ctx, lm.ID, byteLen)
 	if err != nil {
 		return nil, err
 	}
