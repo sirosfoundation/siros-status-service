@@ -14,6 +14,9 @@ primary_region = "fra"
   SHARD_ID = "fra"
   AS_JWKS_URL = "https://siros-status-service-as.fly.dev/.well-known/jwks.json"
   ACCESS_TOKEN_ISSUER = "https://siros-status-service-as.fly.dev"
+  # §19: this is the test deployment — deliberately tight, not a value
+  # meant to generalize to a real deployment's actual credential lifetimes.
+  MAX_EXPIRY = "24h"
 
 [processes]
   app = "/usr/local/bin/ingestion-service"

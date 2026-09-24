@@ -983,3 +983,35 @@ write-heavy enough to justify placement elsewhere.
 in front of it, which is what actually solves per-region *read* latency;
 a verifier replica per region is a later optimization once real
 cache-hit-ratio data justifies it.
+
+## 19. Bounding credential lifetime: `MAX_EXPIRY`
+
+§7 point 2 originally let an issuer set `exp` to anything at all. That's
+a real hygiene/DoS-adjacent gap, not just a validation nicety: a list's
+`max_exp` (§4) is the *only* signal GC (§7 point 4) has for "everything in
+this list has expired, it's safe to archive" — one absurdly-long-lived
+allocation (deliberate or accidental) pins that list's `max_exp` far into
+the future and blocks it from ever being archived/purged, indefinitely,
+regardless of every other entry's real lifetime.
+
+**Decided:** `POST /allocate` gains a per-deployment `MAX_EXPIRY` config
+(`internal/ingestion`'s `IngestionConfig.MaxExpiry`, default `8760h`/365
+days — permissive, since real credential lifetimes vary widely and
+nothing here should assume a "correct" value): a request naming `exp`
+later than `now + MaxExpiry` is rejected outright (`400`), not silently
+clamped down — clamping would hand back a shorter-lived credential than
+the issuer asked for with no way for them to notice short of comparing
+the response. **Omitting `exp` entirely now returns exactly the maximum
+allowed** (`now + MaxExpiry`), not an arbitrary short fallback — treating
+"give me the longest you'll allow" as the sensible default for a caller
+who didn't have an opinion, rather than a separate, disconnected default
+value that could drift from `MaxExpiry` itself. The response now always
+echoes the actual `exp` used (`allocateResponse.Exp`), whether it came
+from the request or from this default, so a caller never has to guess
+which happened.
+
+The test deployment (docs/design.md §18, `fly.ingestion.iad.toml`/
+`fly.ingestion.fra.toml`) sets `MAX_EXPIRY=24h` — deliberately tight,
+appropriate for a pre-production environment issuing throwaway test
+credentials, not a value meant to generalize to a real deployment's
+actual credential lifetimes.

@@ -64,6 +64,14 @@ type IngestionConfig struct {
 	// lists for noise injection.
 	DecoyCheckInterval time.Duration
 
+	// MaxExpiry bounds how far in the future POST /allocate's `exp` may be
+	// set (docs/design.md §19): a request naming a later `exp` is
+	// rejected outright, and a request that omits `exp` gets exactly
+	// now+MaxExpiry — the maximum, not an arbitrary/short fallback. Real
+	// deployments are expected to tighten this well below the permissive
+	// default (e.g. the test deployment uses 24h).
+	MaxExpiry time.Duration
+
 	GCGracePeriod     time.Duration
 	GCRetentionPeriod time.Duration
 	GCCheckInterval   time.Duration
@@ -98,6 +106,7 @@ func LoadIngestion() (*IngestionConfig, error) {
 		PublishInterval:     10 * time.Second,
 		DecoyNoiseRate:      0, // opt-in (§17): unverified against real traffic, never on by default
 		DecoyCheckInterval:  15 * time.Minute,
+		MaxExpiry:           365 * 24 * time.Hour, // permissive default (§19); tighten per deployment
 		GCGracePeriod:       24 * time.Hour,
 		GCRetentionPeriod:   30 * 24 * time.Hour,
 		GCCheckInterval:     time.Hour,
@@ -132,6 +141,9 @@ func LoadIngestion() (*IngestionConfig, error) {
 		return nil, err
 	}
 	if c.DecoyCheckInterval, err = getDurationEnv("DECOY_CHECK_INTERVAL", c.DecoyCheckInterval); err != nil {
+		return nil, err
+	}
+	if c.MaxExpiry, err = getDurationEnv("MAX_EXPIRY", c.MaxExpiry); err != nil {
 		return nil, err
 	}
 	if c.GCGracePeriod, err = getDurationEnv("GC_GRACE_PERIOD", c.GCGracePeriod); err != nil {

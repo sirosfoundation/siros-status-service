@@ -2,6 +2,7 @@ package ingestion
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -12,13 +13,19 @@ import (
 	"github.com/sirosfoundation/siros-status-service/internal/store"
 )
 
+// Exp is optional (docs/design.md §19): a request that omits it gets
+// exactly the maximum allowed expiration (MaxExpiry from now), not an
+// arbitrary short default. binding:"required" was removed for exactly
+// this reason — a zero-value Exp (the JSON field absent) is a real,
+// meaningful "give me the max" request, not an error.
 type allocateRequest struct {
-	Exp time.Time `json:"exp" binding:"required"`
+	Exp time.Time `json:"exp"`
 }
 
 type allocateResponse struct {
-	ListURL string `json:"list_url"`
-	Index   uint64 `json:"index"`
+	ListURL string    `json:"list_url"`
+	Index   uint64    `json:"index"`
+	Exp     time.Time `json:"exp"`
 }
 
 // maxAllocateAttempts bounds retries when the list picked by §8.1's
@@ -29,13 +36,33 @@ type allocateResponse struct {
 // path needing to coordinate with internal/pool's background loop.
 const maxAllocateAttempts = 5
 
-// handleAllocate implements docs/design.md §14 item 3 / §15.1: only the
-// credential's expiration is needed. The caller's issuer identity comes
-// from their verified access token (§15.3), not a request field.
+// handleAllocate implements docs/design.md §14 item 3 / §15.1/§19: the
+// caller's issuer identity comes from their verified access token
+// (§15.3), not a request field, and `exp` is optional — omitting it
+// returns the maximum allowed expiration (§19's MaxExpiry), and naming
+// one further out than that is rejected outright rather than silently
+// clamped, so an issuer never gets a shorter-lived credential than they
+// asked for without knowing it.
 func (s *Server) handleAllocate(c *gin.Context) {
 	var req allocateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": "invalid request: " + err.Error()})
+	// A request body is optional (empty/absent means "no exp given" —
+	// see allocateRequest's doc comment); ShouldBindJSON on a genuinely
+	// empty body would otherwise fail with "EOF" before ever reaching the
+	// zero-value-Exp handling below.
+	if c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": "invalid request: " + err.Error()})
+			return
+		}
+	}
+
+	maxExp := time.Now().Add(s.cfg.MaxExpiry)
+	exp := req.Exp
+	switch {
+	case exp.IsZero():
+		exp = maxExp
+	case exp.After(maxExp):
+		c.JSON(400, gin.H{"error": fmt.Sprintf("exp exceeds the maximum allowed expiration of %s", maxExp.Format(time.RFC3339))})
 		return
 	}
 
@@ -59,7 +86,7 @@ func (s *Server) handleAllocate(c *gin.Context) {
 			return
 		}
 
-		idx, err := s.meta.ReserveCursorAndRecord(ctx, lm.ID, issuerID, s.cfg.ShardID, req.Exp, alloc.Index)
+		idx, err := s.meta.ReserveCursorAndRecord(ctx, lm.ID, issuerID, s.cfg.ShardID, exp, alloc.Index)
 		if err != nil {
 			if errors.Is(err, store.ErrListFull) {
 				continue // §8.1: try again against a freshly-queried pool
@@ -88,6 +115,7 @@ func (s *Server) handleAllocate(c *gin.Context) {
 		c.JSON(201, allocateResponse{
 			ListURL: s.cfg.BaseURL + "/lists/" + lm.ID,
 			Index:   idx,
+			Exp:     exp,
 		})
 		return
 	}

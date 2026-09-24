@@ -99,30 +99,24 @@ func doOp(client *http.Client, ingressURL, token, op string, result *workerResul
 	}
 }
 
-type allocateRequestBody struct {
-	Exp time.Time `json:"exp"`
-}
-
 type allocateResponseBody struct {
-	ListURL string `json:"list_url"`
-	Index   uint64 `json:"index"`
+	ListURL string    `json:"list_url"`
+	Index   uint64    `json:"index"`
+	Exp     time.Time `json:"exp"`
 }
 
-// doAllocate mirrors internal/ingestion's real allocateRequest — only an
-// expiration, 1 to 365 days out, matching real credential lifetimes
-// better than a fixed constant would (varied exp spreads GC eligibility
-// out too, docs/design.md §7 point 4).
+// doAllocate omits `exp` entirely (docs/design.md §19): the server
+// returns exactly its own MAX_EXPIRY-bounded maximum, which works
+// against any target regardless of that deployment's own MAX_EXPIRY —
+// unlike a fixed or randomized exp far in the future, which would now
+// get rejected outright against a tightly-configured target (e.g. the
+// test deployment's 24h). This also directly exercises the §19 default
+// path under real concurrent load, which is worth having covered here.
 func doAllocate(client *http.Client, ingressURL, token string, result *workerResult) error {
-	exp := time.Now().Add(time.Duration(1+rand.IntN(365)) * 24 * time.Hour)
-	body, err := json.Marshal(allocateRequestBody{Exp: exp})
+	req, err := http.NewRequest(http.MethodPost, ingressURL+"/allocate", nil)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, ingressURL+"/allocate", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := client.Do(req)

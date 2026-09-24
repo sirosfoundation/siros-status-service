@@ -142,7 +142,11 @@ curl -X POST localhost:8090/token \
 
 curl -X POST localhost:8094/allocate -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "Content-Type: application/json" -d '{"exp":"2027-01-01T00:00:00Z"}'
-# => {"list_url":"http://localhost:8080/lists/<id>","index":<n>}   -- routed to shard-a automatically
+# => {"list_url":"http://localhost:8080/lists/<id>","index":<n>,"exp":"2027-01-01T00:00:00Z"}
+#    -- routed to shard-a automatically; rejected with 400 if exp is past MAX_EXPIRY (§19)
+
+curl -X POST localhost:8094/allocate -H "Authorization: Bearer $ACCESS_TOKEN"
+# => exp omitted entirely -> exp defaults to exactly the maximum allowed (now + MAX_EXPIRY)
 
 curl -X PATCH "localhost:8094/status/<id>/<n>" -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "Content-Type: application/json" -d '{"status":"INVALID"}'
@@ -188,6 +192,7 @@ Common to every binary: `HTTP_ADDR`, `BASE_URL`, `DATABASE_URL`.
 | `PUBLISH_INTERVAL` | `10s` | backstop poll interval (§9) |
 | `DECOY_NOISE_RATE` | `0` (disabled) | fraction of never-allocated capacity flipped per pass (§17 — "herd immunity" for real revocations); opt-in |
 | `DECOY_CHECK_INTERVAL` | `15m` | how often the decoy sweep runs, when `DECOY_NOISE_RATE` > 0 |
+| `MAX_EXPIRY` | `8760h` (365d) | §19: `POST /allocate`'s `exp` may not exceed now+this; omitting `exp` returns exactly this maximum. Tighten per deployment — the test deployment uses `24h` |
 
 **`cmd/verifier-service`**
 
