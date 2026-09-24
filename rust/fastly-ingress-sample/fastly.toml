@@ -1,0 +1,21 @@
+# Fastly Compute service manifest for this sample. Written against the
+# documented fastly.toml schema (manifest_version 3) but NOT validated
+# against the real `fastly` CLI — this sandbox has no `fastly` binary and no
+# Fastly account to test against (see README.md's "What's not verified"
+# section). Check this against `fastly compute init`'s own generated
+# fastly.toml before a real deploy.
+manifest_version = 3
+name = "siros-status-service-ingress-sample"
+description = "Sample Fastly Compute reimplementation of cmd/ingress-router's token verification + shard routing (docs/design.md's Fastly investigation)."
+authors = ["SIROS Foundation"]
+language = "rust"
+
+[scripts]
+build = "cargo build --bin fastly-ingress-sample --release --target wasm32-wasip1"
+
+[local_server]
+  # `fastly compute serve` needs a Config Store entry and a KV Store bound
+  # locally to exercise the shard-routing and JWKS-caching paths — see
+  # README.md "Local testing" for the exact `fastly compute serve` flags,
+  # since local dictionaries/KV stores are supplied as CLI args or a
+  # separate local-server config, not inline here.

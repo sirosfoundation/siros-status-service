@@ -1,0 +1,13 @@
+[package]
+name = "token-format"
+description = "Decode and validate the ES256 access tokens minted by siros-status-service's cmd/as (go-tokenauth AccessTokenClaims shape) — no HTTP, no JWKS fetching, pure verification against a caller-supplied key set. Portable to wasm32-wasip1 for Fastly Compute."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }

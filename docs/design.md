@@ -747,3 +747,72 @@ unrelated consumers plus a deeper investigation of its existing
 grant-type dispatch than a small, isolated, purpose-built AS needs.
 `go-tokenauth`'s *validator* is still shared (§15.2); only issuance stays
 separate.
+
+## 16. Investigated: `cmd/ingress-router` on a platform-native edge runtime
+
+`cmd/ingress-router` (§15.6) is a small, generic component — verify a
+Bearer token offline, read one claim, proxy to a backend named by that
+claim — that in principle any L7 platform with edge compute could run
+instead of a container we operate. Surveyed Fly.io, Fastly, Google Cloud,
+and AWS for a platform-native replacement:
+
+- **Fly.io** has no matching primitive at all — `fly-proxy` does TLS
+  termination and static host/path routing, no JWT verification, no
+  claims-aware routing.
+- **Google Cloud**'s Apigee is the one genuine declarative, no-code match
+  (`VerifyJWT` + conditional routing on extracted claims), but is a
+  heavyweight, expensive, enterprise API-management product — real
+  overkill for a service this size. Google API Gateway (the lighter
+  ESPv2-based product) validates JWTs natively but only routes on
+  path/method, not claim value.
+- **AWS** API Gateway HTTP APIs have a native JWT authorizer (JWKS URL +
+  issuer + audience, no Lambda needed) for verification, but claim-based
+  *routing* isn't declarative — it needs a Lambda authorizer plus either a
+  Lambda integration or REST API VTL mapping templates, which is
+  architecturally the same router, just moved to a different compute
+  substrate.
+- **Fastly** has no turnkey feature either, but a real substrate: Compute
+  (formerly "Compute@Edge"), their WASM edge runtime, plus Dynamic
+  Backends (proxy to an arbitrary, runtime-resolved origin) and a KV
+  Store, compose into exactly this router's logic.
+
+Conclusion: only GCP has a true no-code match, and it's disproportionate
+for this service. Everywhere else — including Fastly — "platform-native"
+really means rewriting the router's ~100 lines onto that platform's edge
+runtime, which trades away the one thing `cmd/ingress-router` is
+deliberately built for: running identically on any cloud, including Fly
+itself, which has nothing native at all. **Decision: keep
+`cmd/ingress-router` as the primary, portable implementation.**
+
+Fastly's path was investigated further anyway (real edge PoPs are a
+genuine latency argument, if this service ever needs it) and prototyped
+as a real, compiling artifact rather than left as a paper conclusion —
+see `rust/`, a separate Cargo workspace alongside this Go module:
+
+- **`rust/token-format`** — decodes/validates this service's ES256 access
+  tokens (the `go-tokenauth/claims.AccessTokenClaims` shape), tested
+  against a real token minted by `internal/accesstoken.KeyManager`
+  (`tools/gen-fixture`), not a token the crate constructed itself — the
+  same "prove wire compatibility against the real thing" standard §15.3's
+  Go-side test already holds. Confirmed compiling and passing all tests
+  natively and building clean for `wasm32-wasip1` (Fastly Compute's
+  target) with no code changes needed either way.
+- **`rust/fastly-ingress-sample`** — a sample Fastly Compute service built
+  on `token-format`, reimplementing the router's verify-then-route logic
+  using real Fastly Dynamic Backends (routing) and a KV Store (cache-aside
+  JWKS — Compute has no persistent memory between requests, so there's no
+  analog of `go-tokenauth`'s background-refresh goroutine; a TTL-based
+  cache-aside read replaces it). Builds clean to a ~1MB release `.wasm`.
+  **Not deployed or CLI-validated** — no `fastly` CLI or account was
+  available; see that crate's README for exactly what is and isn't
+  proven.
+
+Rust, not Go, for both crates: `go-tokenauth`'s validator is built around
+a long-lived process with a background JWKS-refresh goroutine, which
+doesn't transfer to Fastly's per-request, no-persistent-memory execution
+model regardless of language — the logic has to be rewritten either way,
+so staying in Go would buy no real code reuse. Given that, Rust is
+Fastly's most mature Compute SDK (their own JWT tutorial is written in
+Rust, not Go), and `serde`'s compile-time JSON handling is a better fit
+for WASM than Go's reflection-based `encoding/json` — Go on Compute is
+officially supported but the newer, less-proven path for this pattern.

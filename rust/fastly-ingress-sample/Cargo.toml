@@ -1,0 +1,18 @@
+[package]
+name = "fastly-ingress-sample"
+description = "Sample Fastly Compute service reimplementing cmd/ingress-router's logic (verify a token-format access token, route on its tenant_id claim) — see README.md before deploying this anywhere real."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "fastly-ingress-sample"
+path = "src/main.rs"
+
+[dependencies]
+token-format = { path = "../token-format" }
+fastly = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

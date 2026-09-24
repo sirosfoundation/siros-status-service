@@ -88,6 +88,19 @@ clean: ## Remove build artifacts
 	go clean
 	rm -f bin/as bin/ingestion-service bin/verifier-service bin/ingress-router cover.out cover.html
 
+.PHONY: gen-fixture
+gen-fixture: ## Regenerate rust/token-format's test fixture (a real token from internal/accesstoken.KeyManager)
+	go run ./tools/gen-fixture
+
+.PHONY: rust-test
+rust-test: ## Run the rust/ workspace's tests (docs/design.md §16 — Fastly Compute investigation)
+	cd rust && cargo test --locked -p token-format
+
+.PHONY: rust-build-wasm
+rust-build-wasm: ## Build rust/'s crates for wasm32-wasip1 (Fastly Compute's target); needs `rustup target add wasm32-wasip1`
+	cd rust && cargo build --locked -p token-format --target wasm32-wasip1
+	cd rust && cargo build --locked -p fastly-ingress-sample --target wasm32-wasip1 --release
+
 IMAGE ?= ghcr.io/sirosfoundation/siros-status-service
 
 .PHONY: docker

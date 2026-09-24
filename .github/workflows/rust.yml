@@ -1,0 +1,84 @@
+name: Rust
+
+# The rust/ workspace (docs/design.md §16's Fastly Compute investigation) is
+# not wired into anything the main Go CI builds or tests, so it gets its own
+# workflow, scoped to only run when it could actually be affected.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rust/**'
+      - 'tools/gen-fixture/**'
+      - '.github/workflows/rust.yml'
+  pull_request:
+    paths:
+      - 'rust/**'
+      - 'tools/gen-fixture/**'
+      - '.github/workflows/rust.yml'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: rust
+
+jobs:
+  test:
+    name: Test (token-format)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: rust
+      # Only token-format has tests; fastly-ingress-sample is WASI-only and
+      # excluded from the workspace's default-members (see rust/Cargo.toml).
+      - run: cargo test --locked -p token-format
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: clippy
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: rust
+      - run: cargo clippy --locked -p token-format --all-targets -- -D warnings
+      # fastly-ingress-sample only ever builds for wasm32-wasip1 (Fastly
+      # Compute's target) — no native target to lint it against.
+      - run: cargo clippy --locked -p fastly-ingress-sample --target wasm32-wasip1 -- -D warnings
+
+  wasm:
+    name: Build for wasm32-wasip1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: rust
+      # Confirms token-format itself stays portable, independent of the sample.
+      - run: cargo build --locked -p token-format --target wasm32-wasip1
+      # The actual artifact `fastly compute build` would produce.
+      - run: cargo build --locked -p fastly-ingress-sample --target wasm32-wasip1 --release

@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "token-format",
+    "fastly-ingress-sample",
+]
+
+# fastly-ingress-sample only ever builds for wasm32-wasip1 (Fastly Compute's
+# target) — kept out of the default `cargo build`/`cargo test` set so a plain
+# workspace build on a dev machine's native target doesn't fail on
+# WASI-only dependencies. `cargo test -p token-format` (or `cargo test
+# --workspace --exclude fastly-ingress-sample`) is the everyday command; see
+# fastly-ingress-sample/README.md for how to build it.
+default-members = ["token-format"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+repository = "https://github.com/sirosfoundation/siros-status-service"
