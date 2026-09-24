@@ -4,7 +4,7 @@ import "testing"
 
 func TestAllowAllEvaluator_AlwaysTrusts(t *testing.T) {
 	e := AllowAllEvaluator{}
-	d, err := e.Evaluate(t.Context(), "any-issuer", map[string]any{"kty": "EC"})
+	d, err := e.Evaluate(t.Context(), "any-issuer", CredentialFromJWK(map[string]any{"kty": "EC"}))
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}
@@ -24,7 +24,7 @@ func TestAllowAllEvaluator_Name(t *testing.T) {
 
 func TestAllowAllEvaluator_TrustsEvenWithNilJWK(t *testing.T) {
 	e := AllowAllEvaluator{}
-	d, err := e.Evaluate(t.Context(), "issuer-a", nil)
+	d, err := e.Evaluate(t.Context(), "issuer-a", Credential{})
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}

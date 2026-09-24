@@ -70,16 +70,47 @@ type authzenResponse struct {
 
 const maxAuthZENResponseBytes = 1 << 20 // 1 MiB — generous for a decision payload
 
+// credentialKey builds the AuthZEN resource.key array for cred, matching
+// go-trust/pkg/authzen's confirmed wire shape for each type: a "jwk"
+// resource's key is a one-element array holding the JWK as a JSON
+// object; an "x5c" resource's key is the certificate chain as an array
+// of base64-STANDARD-encoded DER strings, leaf first (verified directly
+// against that package's own golden tests, not assumed).
+func credentialKey(cred Credential) ([]any, error) {
+	switch cred.Type {
+	case CredentialJWK:
+		if cred.JWK == nil {
+			return nil, fmt.Errorf("trust: credential type %q has no JWK", CredentialJWK)
+		}
+		return []any{cred.JWK}, nil
+	case CredentialX5C:
+		if len(cred.X5C) == 0 {
+			return nil, fmt.Errorf("trust: credential type %q has no certificate chain", CredentialX5C)
+		}
+		key := make([]any, len(cred.X5C))
+		for i, c := range cred.X5C {
+			key[i] = c
+		}
+		return key, nil
+	default:
+		return nil, fmt.Errorf("trust: unsupported credential type %q", cred.Type)
+	}
+}
+
 // Evaluate fails closed: a network error, a non-200 response, or a
 // malformed response body all return an error (never a silent
 // Decision{Trusted: true}) — decided 2026-09-24, the counterpart to
 // AllowAllEvaluator's fail-open default when no PDP is configured at
 // all. A PDP that's merely unreachable must never be indistinguishable
 // from "everything is trusted."
-func (e *AuthZENEvaluator) Evaluate(ctx context.Context, subjectID string, jwk map[string]any) (Decision, error) {
+func (e *AuthZENEvaluator) Evaluate(ctx context.Context, subjectID string, cred Credential) (Decision, error) {
+	key, err := credentialKey(cred)
+	if err != nil {
+		return Decision{}, err
+	}
 	reqBody := authzenRequest{
 		Subject:  authzenSubject{Type: "key", ID: subjectID},
-		Resource: authzenResource{Type: "jwk", ID: subjectID, Key: []any{jwk}},
+		Resource: authzenResource{Type: cred.Type, ID: subjectID, Key: key},
 	}
 	if e.actionName != "" {
 		reqBody.Action = &authzenAction{Name: e.actionName}

@@ -28,7 +28,7 @@ func TestAuthZENEvaluator_TrustedDecision(t *testing.T) {
 	defer srv.Close()
 
 	e := NewAuthZENEvaluator(srv.URL, "issue-status-list", nil)
-	d, err := e.Evaluate(t.Context(), "issuer-a", map[string]any{"kty": "EC"})
+	d, err := e.Evaluate(t.Context(), "issuer-a", CredentialFromJWK(map[string]any{"kty": "EC"}))
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestAuthZENEvaluator_UntrustedDecision(t *testing.T) {
 	defer srv.Close()
 
 	e := NewAuthZENEvaluator(srv.URL, "", nil)
-	d, err := e.Evaluate(t.Context(), "issuer-a", map[string]any{"kty": "EC"})
+	d, err := e.Evaluate(t.Context(), "issuer-a", CredentialFromJWK(map[string]any{"kty": "EC"}))
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}
@@ -60,6 +60,44 @@ func TestAuthZENEvaluator_UntrustedDecision(t *testing.T) {
 	}
 }
 
+func TestAuthZENEvaluator_X5CCredential(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req authzenRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if req.Resource.Type != "x5c" {
+			t.Errorf("Resource.Type = %q, want x5c", req.Resource.Type)
+		}
+		if len(req.Resource.Key) != 2 {
+			t.Fatalf("Resource.Key has %d entries, want 2 (the whole chain)", len(req.Resource.Key))
+		}
+		if req.Resource.Key[0] != "leaf-cert-b64" || req.Resource.Key[1] != "intermediate-cert-b64" {
+			t.Errorf("Resource.Key = %+v, want the chain in leaf-first order, unchanged", req.Resource.Key)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(authzenResponse{Decision: true})
+	}))
+	defer srv.Close()
+
+	e := NewAuthZENEvaluator(srv.URL, "", nil)
+	d, err := e.Evaluate(t.Context(), "issuer-a", CredentialFromX5C([]string{"leaf-cert-b64", "intermediate-cert-b64"}))
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if !d.Trusted {
+		t.Fatal("expected a trusted decision")
+	}
+}
+
+func TestAuthZENEvaluator_UnsupportedCredentialType(t *testing.T) {
+	e := NewAuthZENEvaluator("http://127.0.0.1:1", "", nil) // must fail before ever dialing this
+	_, err := e.Evaluate(t.Context(), "issuer-a", Credential{Type: "kid"})
+	if err == nil {
+		t.Fatal("expected an error for an unsupported credential type")
+	}
+}
+
 // The following all exercise docs/design.md §15.2's decided fail-closed
 // behavior: a PDP that's configured but unreachable/erroring must never
 // be treated as "trusted", unlike AllowAllEvaluator's fail-open default
@@ -67,7 +105,7 @@ func TestAuthZENEvaluator_UntrustedDecision(t *testing.T) {
 
 func TestAuthZENEvaluator_FailsClosedOnConnectionError(t *testing.T) {
 	e := NewAuthZENEvaluator("http://127.0.0.1:1", "", nil) // nothing listens here
-	d, err := e.Evaluate(t.Context(), "issuer-a", map[string]any{"kty": "EC"})
+	d, err := e.Evaluate(t.Context(), "issuer-a", CredentialFromJWK(map[string]any{"kty": "EC"}))
 	if err == nil {
 		t.Fatal("expected an error for an unreachable PDP")
 	}
@@ -83,7 +121,7 @@ func TestAuthZENEvaluator_FailsClosedOnNon200(t *testing.T) {
 	defer srv.Close()
 
 	e := NewAuthZENEvaluator(srv.URL, "", nil)
-	d, err := e.Evaluate(t.Context(), "issuer-a", map[string]any{"kty": "EC"})
+	d, err := e.Evaluate(t.Context(), "issuer-a", CredentialFromJWK(map[string]any{"kty": "EC"}))
 	if err == nil {
 		t.Fatal("expected an error for a non-200 PDP response")
 	}
@@ -100,7 +138,7 @@ func TestAuthZENEvaluator_FailsClosedOnMalformedResponse(t *testing.T) {
 	defer srv.Close()
 
 	e := NewAuthZENEvaluator(srv.URL, "", nil)
-	d, err := e.Evaluate(t.Context(), "issuer-a", map[string]any{"kty": "EC"})
+	d, err := e.Evaluate(t.Context(), "issuer-a", CredentialFromJWK(map[string]any{"kty": "EC"}))
 	if err == nil {
 		t.Fatal("expected an error for a malformed PDP response")
 	}
@@ -120,7 +158,7 @@ func TestAuthZENEvaluator_SendsActionNameWhenConfigured(t *testing.T) {
 	defer srv.Close()
 
 	e := NewAuthZENEvaluator(srv.URL, "issue-status-list", nil)
-	if _, err := e.Evaluate(t.Context(), "issuer-a", map[string]any{"kty": "EC"}); err != nil {
+	if _, err := e.Evaluate(t.Context(), "issuer-a", CredentialFromJWK(map[string]any{"kty": "EC"})); err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}
 	if gotAction == nil || gotAction.Name != "issue-status-list" {
@@ -139,7 +177,7 @@ func TestAuthZENEvaluator_OmitsActionWhenNotConfigured(t *testing.T) {
 	defer srv.Close()
 
 	e := NewAuthZENEvaluator(srv.URL, "", nil)
-	if _, err := e.Evaluate(t.Context(), "issuer-a", map[string]any{"kty": "EC"}); err != nil {
+	if _, err := e.Evaluate(t.Context(), "issuer-a", CredentialFromJWK(map[string]any{"kty": "EC"})); err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}
 	if sawActionField {

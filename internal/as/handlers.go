@@ -5,6 +5,7 @@ import (
 
 	"github.com/sirosfoundation/siros-status-service/internal/accesstoken"
 	"github.com/sirosfoundation/siros-status-service/internal/clientassertion"
+	"github.com/sirosfoundation/siros-status-service/internal/trust"
 )
 
 const (
@@ -44,8 +45,23 @@ func (s *Server) handleToken(c *gin.Context) {
 		return
 	}
 
+	// Exactly one of these is populated, matching whichever proof-of-
+	// possession header the assertion carried (docs/design.md §20) — an
+	// x5c-backed credential lets AuthZENEvaluator ask the PDP to validate
+	// the chain against a trust list, rather than a bare, unchained key.
+	var cred trust.Credential
+	switch {
+	case result.JWK != nil:
+		cred = trust.CredentialFromJWK(result.JWK)
+	case len(result.X5C) > 0:
+		cred = trust.CredentialFromX5C(result.X5C)
+	default:
+		c.JSON(401, gin.H{"error": "invalid_client", "error_description": "client assertion carried no usable proof of possession"})
+		return
+	}
+
 	ctx := c.Request.Context()
-	decision, err := s.evaluator.Evaluate(ctx, result.IssuerID, result.JWK)
+	decision, err := s.evaluator.Evaluate(ctx, result.IssuerID, cred)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "server_error", "error_description": "trust evaluation failed"})
 		return

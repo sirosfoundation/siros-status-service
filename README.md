@@ -21,8 +21,9 @@ Four services (docs/design.md §15), each its own binary under `cmd/`:
 
 - **`cmd/as`** (`internal/as`) — the Authorization Server. An issuer
   proves possession of their signing key via a self-signed client
-  assertion (`internal/clientassertion`, RFC 7523-flavored, embedded
-  `jwk` header — no pre-registration needed); a `trust.Evaluator`
+  assertion (`internal/clientassertion`, RFC 7523-flavored, an embedded
+  `jwk` header **or** an `x5c` certificate chain — no pre-registration
+  needed either way; §20); a `trust.Evaluator`
   decides whether that key is trusted (`internal/trust`): if
   `TRUST_PDP_URL` is set, a real AuthZEN-wire-protocol
   `AuthZENEvaluator` against a go-trust PDP, **failing closed** on any

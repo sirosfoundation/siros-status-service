@@ -18,6 +18,6 @@ type AllowAllEvaluator struct{}
 
 func (AllowAllEvaluator) Name() string { return "allow-all" }
 
-func (AllowAllEvaluator) Evaluate(ctx context.Context, subjectID string, jwk map[string]any) (Decision, error) {
+func (AllowAllEvaluator) Evaluate(ctx context.Context, subjectID string, cred Credential) (Decision, error) {
 	return Decision{Trusted: true, Reason: "no trust PDP configured (fail-open default)"}, nil
 }

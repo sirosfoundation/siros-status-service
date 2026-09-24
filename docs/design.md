@@ -1015,3 +1015,47 @@ The test deployment (docs/design.md §18, `fly.ingestion.iad.toml`/
 appropriate for a pre-production environment issuing throwaway test
 credentials, not a value meant to generalize to a real deployment's
 actual credential lifetimes.
+
+## 20. Authenticating with an existing signing certificate (`x5c`)
+
+**The gap:** §15.2's client assertion originally supported only a bare,
+self-asserted public key (a `jwk` JWT header, RFC 7515 §4.1.3) as proof
+of possession. A real credential issuer's actual signing key almost
+always comes as part of a real PKI deployment — an X.509 certificate,
+often itself chaining up to a national or EU trust list (an eIDAS LOTL,
+or more specifically the ARF's List of Trusted Entities for wallet
+ecosystem participants) — and none of that chain material had anywhere
+to go. The issuer's real, already-trusted signing identity couldn't be
+used directly; only a separate, unchained, throwaway key could
+authenticate to this service at all, which defeats the point of already
+holding a real, externally-trusted credential.
+
+**Decided:** `internal/clientassertion.Verify` now also accepts an `x5c`
+JWT header (RFC 7515 §4.1.6: an array of base64-STANDARD-encoded DER
+certificates, leaf first) as an alternative to `jwk` — never both on the
+same assertion. The leaf certificate's public key is what the
+assertion's own signature is checked against (proof of possession works
+exactly the same way either way); the full chain, exactly as presented,
+is what gets forwarded to `internal/trust` for the actual trust
+decision. This service does not itself validate the chain against any
+root — no path building, no root store — that's deliberately left to
+whatever `Evaluator` is configured:
+
+- `AllowAllEvaluator` — unchanged, fail-open regardless of which proof
+  type was used (§15.2's posture generalizes for free: it never looked
+  at the credential's contents in the first place).
+- `AuthZENEvaluator` — now sends `resource.type: "x5c"` with the chain
+  as the resource's `key` array (verified directly against
+  `go-trust/pkg/authzen`'s own golden tests for the exact wire shape,
+  the same way `jwk`'s shape was verified in §15.2) instead of always
+  sending `resource.type: "jwk"`. A go-trust PDP configured to validate
+  `x5c` resources against a real trust list (an ETSI Trusted List, a
+  LOTL/LoTE) is what actually answers "is this chain trusted" — this
+  service only needs to get the chain there intact.
+
+`internal/trust.Evaluator`'s interface changed from taking a bare
+`jwk map[string]any` to a `Credential` (exactly one of `JWK` or `X5C`
+populated) to carry either proof type through — a breaking change to the
+interface, not just an addition, since a single hardcoded assumption
+("it's always a jwk") no longer holds anywhere in the call chain from
+`cmd/as`'s `handleToken` down to the evaluator.
