@@ -6,6 +6,7 @@ threshold:
 exclude:
   paths:
     - ^cmd/                               # entry points — not unit-testable
+    - ^tools/                             # one-off dev tooling (gen-fixture), not unit-testable
     - ^internal/store/                    # Postgres/Redis clients — need live infra, not yet covered
     - ^internal/ingestion/                # HTTP handlers wiring store+pool+publisher — same reason
     - ^internal/verifier/                 # same reason
