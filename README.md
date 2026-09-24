@@ -205,6 +205,58 @@ Common to every binary: `HTTP_ADDR`, `BASE_URL`, `DATABASE_URL`.
 | `ACCESS_TOKEN_AUDIENCE` | `siros-status-service` | |
 | `SHARD_BACKENDS` | *(required)* | JSON object, `shard_id -> ingestion-service base URL` |
 
+## Deploying to Fly
+
+Four separate Fly apps, one per binary, each with its own `fly.*.toml`
+(`fly.as.toml`, `fly.ingestion.toml`, `fly.verifier.toml`,
+`fly.ingress.toml`) — this org's convention for a standalone service is
+its own fly config rather than being orchestrated through `sirosid-dev`
+(see [go-zk-circuits](https://github.com/sirosfoundation/go-zk-circuits)'s
+`fly.toml` for another example of the same pattern). All four apps' public
+`*.fly.dev` hostnames are fixed by their app names, so cross-app URLs
+(`AS_JWKS_URL`, `SHARD_BACKENDS`, ingestion's `BASE_URL` pointing at the
+verifier, ...) are already hardcoded in each file — no separate
+render/glue step needed.
+
+One shared Postgres (metadata only — `-as`, `-ingestion`, and `-verifier`
+all point at it) and one Redis per shard (`-ingestion` writes to its own
+shard's Redis; `-verifier` needs every shard's Redis URL in
+`SHARD_REDIS_URLS`, since a verifier request can name a list from any
+shard). This prototype config uses a single shard, `default`.
+
+```sh
+fly apps create siros-status-service-as
+fly apps create siros-status-service-ingestion
+fly apps create siros-status-service-verifier
+fly apps create siros-status-service-ingress
+
+fly postgres create --name siros-status-service-db --region arn
+fly postgres attach siros-status-service-db -a siros-status-service-as
+fly postgres attach siros-status-service-db -a siros-status-service-ingestion
+fly postgres attach siros-status-service-db -a siros-status-service-verifier
+# `attach` sets each app's DATABASE_URL secret directly — no manual copy needed.
+
+fly redis create --name siros-status-service-redis --region arn --no-replicas
+# fly redis create prints the connection URL once, at creation time — save it.
+
+STATUSLIST_SIGNING_KEY_PEM="$(openssl ecparam -name prime256v1 -genkey -noout)"
+fly secrets set -a siros-status-service-as AS_SIGNING_KEY_PEM="$(openssl ecparam -name prime256v1 -genkey -noout)"
+fly secrets set -a siros-status-service-ingestion SIGNING_KEY_PEM="$STATUSLIST_SIGNING_KEY_PEM" REDIS_URL="<redis URL from above>"
+fly secrets set -a siros-status-service-verifier SIGNING_KEY_PEM="$STATUSLIST_SIGNING_KEY_PEM" SHARD_REDIS_URLS='{"default":"<redis URL from above>"}'
+
+# Deploy order matters only in that the AS should exist before issuers hit
+# it — none of the four block on each other at startup (each only fetches
+# the AS's JWKS lazily, on first token verification), so this order is a
+# convenience, not a hard requirement.
+fly deploy -c fly.as.toml
+fly deploy -c fly.ingestion.toml
+fly deploy -c fly.verifier.toml
+fly deploy -c fly.ingress.toml
+```
+
+`TRUST_PDP_URL` is deliberately left unset in `fly.as.toml` — see "Known
+gaps" below before pointing this at a real deployment.
+
 ## Known gaps vs. the full design
 
 These are intentionally deferred, not oversights:

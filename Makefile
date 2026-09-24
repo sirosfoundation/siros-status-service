@@ -14,13 +14,30 @@ help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: build
-build: ## Build the status-list-service binary
-	go build $(LDFLAGS) -o bin/status-list-service ./cmd/status-list-service
+build: ## Build all four binaries: as, ingestion-service, verifier-service, ingress-router
+	go build $(LDFLAGS) -o bin/as ./cmd/as
+	go build $(LDFLAGS) -o bin/ingestion-service ./cmd/ingestion-service
+	go build $(LDFLAGS) -o bin/verifier-service ./cmd/verifier-service
+	go build $(LDFLAGS) -o bin/ingress-router ./cmd/ingress-router
 
-.PHONY: run
-run: build ## Run against docker-compose'd Redis/Postgres (see `make dev-up`)
-	@test -n "$$SIGNING_KEY_PEM" || (echo "SIGNING_KEY_PEM is not set; try: export SIGNING_KEY_PEM=\"\$$(openssl ecparam -name prime256v1 -genkey -noout)\"" && exit 1)
-	./bin/status-list-service
+.PHONY: run-as
+run-as: build ## Run the AS — see README "Running locally" for the full four-service walkthrough
+	@test -n "$$AS_SIGNING_KEY_PEM" || (echo "AS_SIGNING_KEY_PEM is not set; try: export AS_SIGNING_KEY_PEM=\"\$$(openssl ecparam -name prime256v1 -genkey -noout)\"" && exit 1)
+	./bin/as
+
+.PHONY: run-ingestion
+run-ingestion: build ## Run ingestion-service — see README "Running locally" for required env vars
+	@test -n "$$STATUSLIST_SIGNING_KEY_PEM" || (echo "STATUSLIST_SIGNING_KEY_PEM is not set; try: export STATUSLIST_SIGNING_KEY_PEM=\"\$$(openssl ecparam -name prime256v1 -genkey -noout)\"" && exit 1)
+	SIGNING_KEY_PEM="$$STATUSLIST_SIGNING_KEY_PEM" ./bin/ingestion-service
+
+.PHONY: run-verifier
+run-verifier: build ## Run verifier-service — see README "Running locally" for required env vars
+	@test -n "$$STATUSLIST_SIGNING_KEY_PEM" || (echo "STATUSLIST_SIGNING_KEY_PEM is not set; try: export STATUSLIST_SIGNING_KEY_PEM=\"\$$(openssl ecparam -name prime256v1 -genkey -noout)\"" && exit 1)
+	SIGNING_KEY_PEM="$$STATUSLIST_SIGNING_KEY_PEM" ./bin/verifier-service
+
+.PHONY: run-ingress
+run-ingress: build ## Run ingress-router — see README "Running locally" for required env vars
+	./bin/ingress-router
 
 .PHONY: dev-up
 dev-up: ## Start local Redis/Postgres for development
@@ -69,7 +86,7 @@ tidy: ## Tidy module dependencies
 .PHONY: clean
 clean: ## Remove build artifacts
 	go clean
-	rm -f bin/status-list-service cover.out cover.html
+	rm -f bin/as bin/ingestion-service bin/verifier-service bin/ingress-router cover.out cover.html
 
 IMAGE ?= ghcr.io/sirosfoundation/siros-status-service
 

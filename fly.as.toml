@@ -1,0 +1,53 @@
+# Standalone Fly app config for cmd/as, the Authorization Server
+# (docs/design.md §15.2) — one of four apps this repo deploys as separate
+# Fly apps from the same image (see fly.ingestion.toml, fly.verifier.toml,
+# fly.ingress.toml), following this org's convention that every standalone
+# Go service ships its own fly.toml rather than being orchestrated through
+# sirosid-dev (see go-zk-circuits/fly.toml). README.md "Deploying to Fly"
+# has the one-time setup and deploy order for all four.
+#
+# All four apps' public *.fly.dev hostnames are deterministic from the
+# fixed app names below, so cross-app URLs (AS_JWKS_URL, ACCESS_TOKEN_ISSUER,
+# SHARD_BACKENDS, ...) are hardcoded as plain env vars in each file — no
+# dependency-injection/render step needed.
+#
+# Required secrets before first deploy:
+#   fly secrets set -a siros-status-service-as \
+#     DATABASE_URL="postgres://...shared with -ingestion and -verifier..." \
+#     AS_SIGNING_KEY_PEM="$(openssl ecparam -name prime256v1 -genkey -noout)"
+
+app = "siros-status-service-as"
+primary_region = "arn"
+
+[build]
+
+[env]
+  HTTP_ADDR = ":8080"
+  BASE_URL = "https://siros-status-service-as.fly.dev"
+  SHARDS = "default"
+  # Unset here: AllowAllEvaluator, fail-open (docs/design.md §15.2) — fine
+  # for this prototype, never for a real deployment. Set to a live
+  # go-trust PDP's base URL for real, fail-closed AuthZEN trust evaluation:
+  # TRUST_PDP_URL = "https://pdp.example.org"
+
+[processes]
+  app = "/usr/local/bin/as"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/healthz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

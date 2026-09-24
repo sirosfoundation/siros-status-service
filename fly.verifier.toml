@@ -1,0 +1,46 @@
+# Standalone Fly app config for cmd/verifier-service, the unauthenticated
+# read-only side of the split described in docs/design.md §15.1 — see
+# fly.as.toml's header comment for the four-app convention this follows.
+# This is the app whose URL issuers get back as POST /allocate's
+# `list_url` (see fly.ingestion.toml's BASE_URL) and that verifiers poll.
+#
+# Required secrets before first deploy:
+#   fly secrets set -a siros-status-service-verifier \
+#     DATABASE_URL="postgres://...same Postgres as -as and -ingestion..." \
+#     SIGNING_KEY_PEM="...same value as -ingestion's SIGNING_KEY_PEM..." \
+#     SHARD_REDIS_URLS='{"default":"redis://...this shard's Redis..."}'
+#       # ^ JSON object, shard_id -> Redis URL — one entry per shard this
+#       #   instance can serve (all of them, since sharding is logical, not
+#       #   physical, per README.md "Known gaps"). Add an entry per shard
+#       #   as more are introduced.
+
+app = "siros-status-service-verifier"
+primary_region = "arn"
+
+[build]
+
+[env]
+  HTTP_ADDR = ":8080"
+  BASE_URL = "https://siros-status-service-verifier.fly.dev"
+
+[processes]
+  app = "/usr/local/bin/verifier-service"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/healthz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
