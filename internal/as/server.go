@@ -17,12 +17,11 @@ type Server struct {
 	cfg       *config.ASConfig
 	km        *accesstoken.KeyManager
 	evaluator trust.Evaluator
-	registry  *trust.StaticRegistryEvaluator
 	shards    *ShardAssigner
 }
 
-func New(cfg *config.ASConfig, km *accesstoken.KeyManager, evaluator trust.Evaluator, registry *trust.StaticRegistryEvaluator, shards *ShardAssigner) *Server {
-	return &Server{cfg: cfg, km: km, evaluator: evaluator, registry: registry, shards: shards}
+func New(cfg *config.ASConfig, km *accesstoken.KeyManager, evaluator trust.Evaluator, shards *ShardAssigner) *Server {
+	return &Server{cfg: cfg, km: km, evaluator: evaluator, shards: shards}
 }
 
 func (s *Server) Router() *gin.Engine {
@@ -32,7 +31,6 @@ func (s *Server) Router() *gin.Engine {
 	r.GET("/healthz", s.handleHealthz)
 	r.GET("/.well-known/jwks.json", s.handleJWKS)
 	r.POST("/token", s.handleToken)
-	r.POST("/admin/issuers", s.handleRegisterIssuer)
 
 	return r
 }

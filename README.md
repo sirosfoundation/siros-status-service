@@ -22,14 +22,17 @@ Four services (docs/design.md §15), each its own binary under `cmd/`:
 - **`cmd/as`** (`internal/as`) — the Authorization Server. An issuer
   proves possession of their signing key via a self-signed client
   assertion (`internal/clientassertion`, RFC 7523-flavored, embedded
-  `jwk` header — no pre-registration URL needed); a `trust.Evaluator`
-  decides whether that key is trusted (`internal/trust`: a
-  Postgres-backed `StaticRegistryEvaluator` by default, or a real
-  AuthZEN-wire-protocol `AuthZENEvaluator` against a go-trust PDP if
-  `TRUST_PDP_URL` is set); on success, mints an access token shaped as
-  `go-tokenauth/claims.AccessTokenClaims` (`internal/accesstoken`),
-  assigning the issuer to a shard on first request
-  (`internal/as/shard.go`, sticky thereafter).
+  `jwk` header — no pre-registration needed); a `trust.Evaluator`
+  decides whether that key is trusted (`internal/trust`): if
+  `TRUST_PDP_URL` is set, a real AuthZEN-wire-protocol
+  `AuthZENEvaluator` against a go-trust PDP, **failing closed** on any
+  PDP error; if unset, `AllowAllEvaluator` — **fail open**, dev/prototype
+  only, `cmd/as` logs a warning. (An earlier Postgres-backed static
+  allow-list evaluator was removed as pure duplication — go-trust's own
+  PDP already has an equivalent whitelist-registry mode.) On success,
+  mints an access token shaped as `go-tokenauth/claims.AccessTokenClaims`
+  (`internal/accesstoken`), assigning the issuer to a shard on first
+  request (`internal/as/shard.go`, sticky thereafter).
 - **`cmd/ingestion-service`** (`internal/ingestion`) — issuer-facing:
   `POST /allocate`, `PATCH /status/{listID}/{idx}`,
   `GET /accounting/me`. One process = one shard. Verifies access tokens
@@ -95,9 +98,12 @@ export AS_SIGNING_KEY_PEM="$(openssl ecparam -name prime256v1 -genkey -noout)"
 export STATUSLIST_SIGNING_KEY_PEM="$(openssl ecparam -name prime256v1 -genkey -noout)"
 export ISSUER_KEY_PEM="$(openssl ecparam -name prime256v1 -genkey -noout)"
 
-# 1. AS
+# 1. AS — no TRUST_PDP_URL below means fail-open (AllowAllEvaluator):
+# fine for this local walkthrough, never for a real deployment. Set
+# TRUST_PDP_URL to a real go-trust PDP to get real (fail-closed) trust
+# evaluation instead.
 DATABASE_URL=... BASE_URL=http://localhost:8090 HTTP_ADDR=:8090 \
-  AS_SIGNING_KEY_PEM="$AS_SIGNING_KEY_PEM" ADMIN_TOKEN=admin-secret SHARDS=shard-a \
+  AS_SIGNING_KEY_PEM="$AS_SIGNING_KEY_PEM" SHARDS=shard-a \
   go run ./cmd/as &
 
 # 2. ingestion-service (shard-a)
@@ -118,16 +124,15 @@ AS_JWKS_URL=http://localhost:8090/.well-known/jwks.json ACCESS_TOKEN_ISSUER=http
   go run ./cmd/ingress-router &
 ```
 
-Then, as an issuer: register your key (admin operation, §15.8), get a
-token, and use it through the router.
+Then, as an issuer: get a token (no separate registration step — in
+fail-open mode any presented key is trusted; with a real PDP configured,
+trust comes from whatever policy it enforces) and use it through the
+router.
 
 ```sh
-# JWK + a self-signed client assertion (embedded jwk header) — see
+# A self-signed client assertion (embedded jwk header) — see
 # internal/clientassertion's tests for the exact construction; any small
 # script using go-jose + golang-jwt/v5 as shown there works.
-
-curl -X POST localhost:8090/admin/issuers -H "Authorization: Bearer admin-secret" \
-  -H "Content-Type: application/json" -d "{\"issuer_id\":\"issuer-a\",\"jwk\":$ISSUER_JWK}"
 
 curl -X POST localhost:8090/token \
   --data-urlencode grant_type=client_credentials \
@@ -158,8 +163,7 @@ Common to every binary: `HTTP_ADDR`, `BASE_URL`, `DATABASE_URL`.
 | `SHARDS` | `default` | comma-separated shard IDs new issuers round-robin/hash-assign into (§15.5) |
 | `ACCESS_TOKEN_TTL` | `1h` | |
 | `ACCESS_TOKEN_AUDIENCE` | `siros-status-service` | |
-| `ADMIN_TOKEN` | *(required)* | gates `POST /admin/issuers` (§15.8: no self-service registration yet) |
-| `TRUST_PDP_URL` | *(unset)* | if set, also tries a real AuthZEN PDP alongside the static registry |
+| `TRUST_PDP_URL` | *(unset)* | if set, trust evaluation goes to a real AuthZEN PDP, **fail-closed** on any PDP error; if unset, `AllowAllEvaluator` — **fail-open**, dev/prototype only |
 | `TRUST_ACTION_NAME` | *(unset)* | AuthZEN `action.name` sent with PDP evaluations |
 
 **`cmd/ingestion-service`**
@@ -219,12 +223,12 @@ These are intentionally deferred, not oversights:
 - **AuthZEN trust evaluation is untested against a live PDP**: the wire
   client (`internal/trust.AuthZENEvaluator`) is real, but no go-trust
   PDP is deployed for this service yet (see design doc §15.2 for why
-  importing go-trust's own Go client wasn't the right move either).
+  importing go-trust's own Go client wasn't the right move either) — so
+  today this only ever runs in `AllowAllEvaluator`'s fail-open mode.
+  **Do not deploy without `TRUST_PDP_URL` set to a real PDP.**
 - **Sharding is logical, not physical**: multiple processes/Redis
   instances, not separate infrastructure/regions.
 - **AS key rotation**: a single static key, not a rotating set.
-- **Issuer registration is admin-only**: `POST /admin/issuers` has no
-  self-service flow.
 - **Pool maintenance has no cross-process lock**: `internal/pool`'s
   "count ACTIVE lists, then create more if under Width" can transiently
   overshoot `POOL_WIDTH` under a race. Harmless at prototype scale (see

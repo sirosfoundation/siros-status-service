@@ -538,14 +538,19 @@ possession, not yet a trust decision.
 
 **Trust decision:** the AS then asks a `TrustEvaluator` whether that
 specific name-to-key binding is trusted for the issuer role. Two
-implementations:
+implementations, selected by whether `TRUST_PDP_URL` is configured
+(decided 2026-09-24):
 
-- `StaticRegistryEvaluator` — a Postgres-backed table of pre-registered
-  `issuer_id -> JWK`, admin-managed. Trusts if the presented key matches
-  what's on file. This mirrors the pattern already in production elsewhere
-  in the org (`vc-mdoc-preset`'s `ClientAssertionVerifier`, which checks a
-  client's assertion against a pre-registered `jwks_uri`) and is the
-  default/dev path — it needs no external service running.
+- `AllowAllEvaluator` — trusts everything, unconditionally. The default
+  when `TRUST_PDP_URL` is unset: **fail open**, so a prototype/dev
+  deployment works without standing up a PDP first. Never appropriate
+  for production — `cmd/as` logs a warning on startup whenever this is
+  selected. An earlier pass of this doc had a Postgres-backed
+  `StaticRegistryEvaluator` (pre-registered `issuer_id -> JWK`, admin-
+  managed) as the default instead; that was removed as pure duplication
+  — go-trust's own PDP already has an equivalent whitelist-registry
+  mode, so a second, divergent static allow-list living in this
+  service's own database was never buying anything.
 - `AuthZENEvaluator` — a real HTTP client speaking the actual AuthZEN wire
   protocol go-trust's PDP exposes (`POST {pdp}/evaluation` with
   `{subject:{type:"key",id}, resource:{type:"jwk"|"x5c",id,key}}`,
@@ -564,7 +569,12 @@ implementations:
   interface both implementations satisfy) mirrors go-trust's own
   `pkg/trustapi.TrustEvaluator` shape for conceptual consistency, so
   swapping evaluators — or later vendoring the real client if the
-  toolchain gap closes — is a drop-in, not a rewrite.
+  toolchain gap closes — is a drop-in, not a rewrite. Once
+  `TRUST_PDP_URL` is set, this evaluator **fails closed**: a network
+  error, non-200 response, or malformed body all return an error rather
+  than a silent trust decision, so a merely-unreachable PDP is never
+  indistinguishable from "everything is trusted" — the opposite failure
+  mode from `AllowAllEvaluator`'s deliberate fail-open default above.
 
 **`go-tokenauth` for verification, our own AS for issuance:**
 `go-tokenauth` already implements exactly the JWKS-fetch-and-validate-
@@ -701,29 +711,30 @@ Verifier ──GET /lists/{id}──▶  cmd/verifier-service ──▶ shared P
 ### 15.8 Prototype scope for this phase
 
 Real, not stubbed: the client-assertion verification (actual signature
-check against issuer-presented key material), `StaticRegistryEvaluator`
-(a genuine trust decision, just backed by a pre-registered table instead
-of a live PDP), offline JWT verification via `go-tokenauth`'s real
-validator/jwks/tokengin (§15.2 — not a lookalike), per-route TAC
-permission enforcement, the accounting table and its transactional
-increment, the `shard_id`-scoped pool queries, and the ingress router's
-routing logic. Also confirmed live: two ingestion-service instances
-sharing one Postgres and starting concurrently hit a genuine Postgres
-catalog race applying the same `CREATE TABLE IF NOT EXISTS` schema at
-once (`duplicate key value violates unique constraint
-pg_type_typname_nsp_index`) — fixed with `internal/pgutil.ApplySchema`,
-an advisory lock serializing schema application across every process
-sharing a schema, applied everywhere this service does its own DDL
-(`internal/store`, `internal/trust`, `internal/as`).
+check against issuer-presented key material), the fail-open/fail-closed
+trust decision (§15.2 — `AllowAllEvaluator` and `AuthZENEvaluator` are
+both real, not placeholders; only whether a live PDP exists to point
+`AuthZENEvaluator` at is the open item), offline JWT verification via
+`go-tokenauth`'s real validator/jwks/tokengin (not a lookalike),
+per-route TAC permission enforcement, the accounting table and its
+transactional increment, the `shard_id`-scoped pool queries, and the
+ingress router's routing logic. Also confirmed live: two
+ingestion-service instances sharing one Postgres and starting
+concurrently hit a genuine Postgres catalog race applying the same
+`CREATE TABLE IF NOT EXISTS` schema at once (`duplicate key value
+violates unique constraint pg_type_typname_nsp_index`) — fixed with
+`internal/pgutil.ApplySchema`, an advisory lock serializing schema
+application across every process sharing a schema, applied everywhere
+this service does its own DDL (`internal/store`, `internal/as`).
 
 Deliberately simplified: `AuthZENEvaluator` is real wire-protocol code but
 untested against a live go-trust PDP (none is deployed for this service
 yet — see §15.2 on why importing go-trust's Go client wasn't the right
-move for standing one up quickly either); sharding is logical/config-driven
-(multiple processes on one host or a docker-compose, not physically
-separate infrastructure); the AS's own key is a single static key, not a
-rotating set; and issuer registration into `StaticRegistryEvaluator`'s
-table has no self-service flow yet (an admin operation).
+move for standing one up quickly either, so until a PDP exists this
+service can only run in `AllowAllEvaluator`'s fail-open mode); sharding
+is logical/config-driven (multiple processes on one host or a
+docker-compose, not physically separate infrastructure); and the AS's
+own key is a single static key, not a rotating set.
 
 Explicitly considered and rejected: extending `go-wallet-backend`'s
 existing AS with this client-assertion grant, instead of running a

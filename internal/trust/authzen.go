@@ -70,6 +70,12 @@ type authzenResponse struct {
 
 const maxAuthZENResponseBytes = 1 << 20 // 1 MiB — generous for a decision payload
 
+// Evaluate fails closed: a network error, a non-200 response, or a
+// malformed response body all return an error (never a silent
+// Decision{Trusted: true}) — decided 2026-09-24, the counterpart to
+// AllowAllEvaluator's fail-open default when no PDP is configured at
+// all. A PDP that's merely unreachable must never be indistinguishable
+// from "everything is trusted."
 func (e *AuthZENEvaluator) Evaluate(ctx context.Context, subjectID string, jwk map[string]any) (Decision, error) {
 	reqBody := authzenRequest{
 		Subject:  authzenSubject{Type: "key", ID: subjectID},

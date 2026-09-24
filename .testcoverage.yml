@@ -16,10 +16,6 @@ exclude:
                                            # pure and fully unit-tested, so it's NOT excluded here.
     - ^internal/config/                   # thin env-var loader, low value to unit test in isolation
     - ^internal/gc/                       # archive/purge sweep — needs live Postgres/Redis, same reason
-    - ^internal/trust/static\.go$          # Postgres-backed registry — needs live infra
-    - ^internal/trust/authzen\.go$         # HTTP client against a live PDP — none deployed to test against yet.
-                                           # trust.go (interface) and composite.go (Any, pure logic) are
-                                           # NOT excluded — composite.go is fully unit-tested.
 override:
   # internal/pool's pure selection logic (ChooseByPowerOfTwo) is fully
   # tested; Manager's methods (EnsureHealthy, PickForAllocation, Run,

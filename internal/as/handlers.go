@@ -1,9 +1,6 @@
 package as
 
 import (
-	"crypto/subtle"
-	"strings"
-
 	"github.com/gin-gonic/gin"
 
 	"github.com/sirosfoundation/siros-status-service/internal/accesstoken"
@@ -83,35 +80,4 @@ func (s *Server) handleToken(c *gin.Context) {
 	}
 
 	c.JSON(200, tokenResponse{AccessToken: token, TokenType: "Bearer", ExpiresIn: int64(expiresIn.Seconds())})
-}
-
-type registerIssuerRequest struct {
-	IssuerID string         `json:"issuer_id" binding:"required"`
-	JWK      map[string]any `json:"jwk" binding:"required"`
-}
-
-// handleRegisterIssuer is the admin operation backing
-// StaticRegistryEvaluator (docs/design.md §15.8: "no self-service flow
-// yet"). Gated by a static admin token — a prototype-appropriate
-// simplification of the same kind as internal/api's earlier no-auth mode,
-// not a real admin-authentication story.
-func (s *Server) handleRegisterIssuer(c *gin.Context) {
-	authz := c.GetHeader("Authorization")
-	token, ok := strings.CutPrefix(authz, "Bearer ")
-	if !ok || subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.AdminToken)) != 1 {
-		c.AbortWithStatusJSON(401, gin.H{"error": "missing or invalid admin token"})
-		return
-	}
-
-	var req registerIssuerRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": "invalid request: " + err.Error()})
-		return
-	}
-
-	if err := s.registry.Register(c.Request.Context(), req.IssuerID, req.JWK); err != nil {
-		c.JSON(500, gin.H{"error": "could not register issuer"})
-		return
-	}
-	c.Status(204)
 }

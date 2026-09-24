@@ -219,15 +219,13 @@ type ASConfig struct {
 	// assigned into on first token issuance (§15.5).
 	Shards []string
 
-	// TrustPDPURL, if set, enables the AuthZENEvaluator (§15.2) as an
-	// additional trust source alongside the static registry. Empty
-	// disables it — no live PDP is required to run this service.
+	// TrustPDPURL selects the trust source (decided 2026-09-24): if set,
+	// evaluations go to a real go-trust PDP over AuthZEN, and a PDP
+	// error/unreachability fails closed (no token issued). If unset, the
+	// default is AllowAllEvaluator — fail *open* — so a prototype/dev
+	// deployment works without a PDP; never appropriate for production.
 	TrustPDPURL     string
 	TrustActionName string
-
-	// AdminToken gates the issuer-registration endpoint (§15.8: "no
-	// self-service flow yet" — this is the admin operation).
-	AdminToken string
 }
 
 func LoadAS() (*ASConfig, error) {
@@ -240,7 +238,6 @@ func LoadAS() (*ASConfig, error) {
 		AccessTokenAudience: getEnv("ACCESS_TOKEN_AUDIENCE", "siros-status-service"),
 		TrustPDPURL:         os.Getenv("TRUST_PDP_URL"),
 		TrustActionName:     os.Getenv("TRUST_ACTION_NAME"),
-		AdminToken:          os.Getenv("ADMIN_TOKEN"),
 	}
 	var err error
 	if c.AccessTokenTTL, err = getDurationEnv("ACCESS_TOKEN_TTL", c.AccessTokenTTL); err != nil {
@@ -252,9 +249,6 @@ func LoadAS() (*ASConfig, error) {
 
 	shards := getEnv("SHARDS", "default")
 	c.Shards = strings.Split(shards, ",")
-	if c.AdminToken == "" {
-		return nil, fmt.Errorf("config: ADMIN_TOKEN is required (gates the issuer-registration endpoint)")
-	}
 	return c, nil
 }
 

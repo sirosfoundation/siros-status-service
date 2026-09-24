@@ -36,16 +36,19 @@ func run() error {
 		return err
 	}
 
-	registry, err := trust.NewStaticRegistryEvaluator(ctx, cfg.PostgresDSN)
-	if err != nil {
-		return err
-	}
-	defer registry.Close()
-
-	var evaluator trust.Evaluator = registry
+	// Trust source (decided 2026-09-24): a real PDP if configured (fails
+	// closed on any error — see AuthZENEvaluator.Evaluate's doc comment),
+	// otherwise AllowAllEvaluator (fails open) — never a static registry
+	// in this service, since go-trust's own PDP already has an equivalent
+	// whitelist-registry mode; duplicating that here would just be a
+	// second, divergent source of truth for the same decision.
+	var evaluator trust.Evaluator
 	if cfg.TrustPDPURL != "" {
-		evaluator = trust.Any{registry, trust.NewAuthZENEvaluator(cfg.TrustPDPURL, cfg.TrustActionName, nil)}
-		slog.Info("as: AuthZEN trust evaluation enabled", "pdp_url", cfg.TrustPDPURL)
+		evaluator = trust.NewAuthZENEvaluator(cfg.TrustPDPURL, cfg.TrustActionName, nil)
+		slog.Info("as: AuthZEN trust evaluation enabled (fail-closed on PDP errors)", "pdp_url", cfg.TrustPDPURL)
+	} else {
+		evaluator = trust.AllowAllEvaluator{}
+		slog.Warn("as: no TRUST_PDP_URL configured — running fail-open (allow-all); do not use this in production")
 	}
 
 	shards, err := as.NewShardAssigner(ctx, cfg.PostgresDSN, cfg.Shards)
@@ -55,7 +58,7 @@ func run() error {
 	defer shards.Close()
 
 	km := accesstoken.NewKeyManager(cfg.SigningKey, cfg.SigningKeyID)
-	srv := as.New(cfg, km, evaluator, registry, shards)
+	srv := as.New(cfg, km, evaluator, shards)
 
 	httpSrv := &http.Server{Addr: cfg.HTTPAddr, Handler: srv.Router()}
 	go func() {
