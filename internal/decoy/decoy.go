@@ -22,17 +22,30 @@
 // nextDecoyStatus) — anything statistically distinguishable from a real
 // entry's behavior would defeat the purpose.
 //
-// Safety: a decoy candidate is always derived from a cursor position
-// strictly at or beyond a list's CURRENT cursor — i.e. a position that has
-// never been, and (for ACTIVE/FROZEN lists) might one day be, handed out.
-// internal/ingestion's handleAllocate resets a freshly allocated index to
-// VALID as its very next write after reserving it, which is what makes
-// this safe even under a race: the issuer only ever sees the index after
-// that reset has completed, and internal/store.ReserveCursorAndRecord's
-// atomic cursor bump means a position, once consumed, is never a decoy
-// candidate again (see NoiseLists's doc comment for why ARCHIVED lists
-// have no such race to worry about at all — their cursor is permanently
-// frozen).
+// Safety is two-directional, and each direction is closed a different way:
+//
+//   - decoy-flips-then-gets-really-allocated: internal/ingestion's
+//     handleAllocate resets a freshly allocated index to VALID as its very
+//     next write after reserving it, unconditionally overwriting any decoy
+//     noise sitting there — the issuer only ever sees the index after that
+//     reset completes, so this direction is closed by construction, not by
+//     timing.
+//   - already-really-allocated-then-a-decoy-overwrites-it: a sweep pass
+//     reads a list's cursor once, at the top of sweepList, and samples
+//     candidates against that snapshot for the whole pass — under real
+//     write concurrency, the cursor can advance past a candidate position
+//     while the pass is still running on *other* candidates. sweepList
+//     therefore re-checks store.IsAllocated immediately before each
+//     individual Redis write, shrinking this direction's race window from
+//     "the whole sweep pass" down to "the gap between that one query and
+//     the write right after it" — narrow, not zero, the same class of
+//     documented residual race as internal/pool's POOL_WIDTH overshoot
+//     (see that package's doc), not eliminated the way the first
+//     direction is.
+//
+// See NoiseLists's doc comment for why ARCHIVED lists have no race to
+// worry about at all in either direction — their cursor is permanently
+// frozen, so "a candidate gets really allocated" can never happen there.
 package decoy
 
 import (
@@ -135,6 +148,24 @@ func (n *Noiser) sweepList(ctx context.Context, lm *store.ListMeta) error {
 		}
 		next, changed := nextDecoyStatus(cur)
 		if !changed {
+			continue
+		}
+
+		// lm.Cursor was read once, at the top of this sweep pass — under
+		// real write concurrency, a real allocation can consume this exact
+		// idx and complete its own VALID-reset (internal/ingestion's
+		// handleAllocate) *while this sweep is still running* on other
+		// candidates, making that stale cursor read wrong by the time this
+		// specific write happens. Re-checking right here, immediately
+		// before the Redis write, shrinks that window from "this whole
+		// sweep pass" (many candidates, many round trips) down to "the gap
+		// between this one query and the one write right after it" — not
+		// zero, but the same class of narrow, documented residual race as
+		// internal/pool's POOL_WIDTH overshoot (see that package's doc),
+		// not the sweep-pass-wide exposure an unchecked write would have.
+		if allocated, err := n.meta.IsAllocated(ctx, lm.ID, idx); err != nil {
+			return err
+		} else if allocated {
 			continue
 		}
 

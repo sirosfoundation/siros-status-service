@@ -389,6 +389,23 @@ func (m *MetaStore) ReserveCursorAndRecord(ctx context.Context, listID, issuerID
 	return idx, nil
 }
 
+// IsAllocated reports whether idx within listID has ever been given out
+// to a real issuer, regardless of who owns it — internal/decoy's narrow
+// pre-write check (docs/design.md §17) that a candidate position hasn't
+// been consumed by a real allocation since the sweep read this list's
+// cursor.
+func (m *MetaStore) IsAllocated(ctx context.Context, listID string, idx uint64) (bool, error) {
+	var exists bool
+	err := m.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM allocations WHERE list_id = $1 AND idx = $2)`,
+		listID, int64(idx),
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("store: check allocated: %w", err)
+	}
+	return exists, nil
+}
+
 // CheckOwnership returns nil if issuerID owns idx within listID, and
 // ErrNotOwner (or the allocation-not-found variant of it) otherwise.
 func (m *MetaStore) CheckOwnership(ctx context.Context, listID string, idx uint64, issuerID string) error {

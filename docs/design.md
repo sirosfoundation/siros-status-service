@@ -879,12 +879,23 @@ back out, defeating the whole point. A decoy flip is cache-invalidated
 through the same `publisher.MarkDirty` path a real status change uses,
 so cache behavior doesn't distinguish them either.
 
-**Safety invariant:** a decoy candidate index is always derived from a
-cursor position at or beyond a list's *current* cursor at read time —
-`internal/store.ReserveCursorAndRecord`'s atomic cursor bump means a
-position, once consumed, is never a decoy candidate again. Combined with
-point 1's explicit reset, this holds for ACTIVE and FROZEN lists too, not
-just the collision-free ARCHIVED case.
+**Safety invariant, two directions (found and closed 2026-09-24, before
+any load test ran — see `internal/decoy`'s package doc for the full
+version):** a decoy candidate index is always derived from a cursor
+position that was at or beyond a list's cursor *when the sweep pass
+started*. Point 1's explicit VALID-reset closes the "decoy flips it, then
+it gets really allocated" direction by construction. It does **not**
+close the reverse: a sweep pass reads a list's cursor once for the whole
+pass, so under real write concurrency the cursor can advance past a
+candidate position while the pass is still working through *other*
+candidates — a decoy write landing after that would silently stomp a
+real, possibly-already-revoked credential's real status. `sweepList`
+re-checks `store.IsAllocated` immediately before each individual Redis
+write to close this, shrinking the window from "the whole sweep pass" to
+"the gap between one query and the write right after it" — narrow, not
+zero, the same class of documented residual race as §11's
+`internal/pool` `POOL_WIDTH` overshoot. ARCHIVED lists have no race in
+either direction: their cursor is permanently frozen.
 
 **Deliberately simplified for this pass:** the noise rate is a flat
 fraction of a list's *remaining* capacity per check interval, not scaled
