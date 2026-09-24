@@ -11,10 +11,11 @@
 
 use std::time::Duration;
 
+use fastly::http::header::WWW_AUTHENTICATE;
 use fastly::http::{StatusCode, Url};
 use fastly::kv_store::{KVStore, KVStoreError};
 use fastly::{Backend, ConfigStore, Error, Request, Response};
-use token_format::{validate, JwkSet, ValidationOptions};
+use token_format::{validate, JwkSet, TokenError, ValidationOptions};
 
 /// In a real deployment these three would come from a Config Store entry
 /// (set once at `fastly compute deploy` time, no rebuild needed to point
@@ -39,10 +40,14 @@ fn main(req: Request) -> Result<Response, Error> {
     let token = match bearer_token(&req) {
         Some(t) => t,
         None => {
+            // RFC 6750 §3: the request itself is malformed (no bearer token
+            // was even presented), as distinct from a bearer token that was
+            // presented but rejected.
             return Ok(text_response(
                 StatusCode::UNAUTHORIZED,
                 "missing or malformed Authorization header",
-            ))
+            )
+            .with_header(WWW_AUTHENTICATE, r#"Bearer error="invalid_request""#));
         }
     };
 
@@ -60,10 +65,12 @@ fn main(req: Request) -> Result<Response, Error> {
     let claims = match validate(token, &jwks, &opts) {
         Ok(claims) => claims,
         Err(e) => {
+            let challenge = bearer_invalid_token_challenge(&e);
             return Ok(text_response(
                 StatusCode::UNAUTHORIZED,
                 &format!("invalid access token: {e}"),
-            ))
+            )
+            .with_header(WWW_AUTHENTICATE, challenge));
         }
     };
 
@@ -96,6 +103,65 @@ fn bearer_token(req: &Request) -> Option<&str> {
 
 fn text_response(status: StatusCode, body: &str) -> Response {
     Response::from_status(status).with_body_text_plain(body)
+}
+
+/// Builds the RFC 6750 §3 `WWW-Authenticate` challenge for a rejected
+/// bearer token, distinguishing `TokenError::Expired` from every other
+/// rejection reason via `error_description` (RFC 6750 has no separate
+/// "expired" error *code* — expiry is signaled via `error_description` on
+/// `invalid_token`). Mirrors `internal/ingress/router.go`'s
+/// `bearerInvalidTokenChallenge` (Go) so both implementations of "the same
+/// service" signal the same way, matched explicitly on the `TokenError`
+/// variant rather than its `Display` text.
+fn bearer_invalid_token_challenge(err: &TokenError) -> String {
+    let description = match err {
+        TokenError::Expired => "the access token expired",
+        _ => "the access token is invalid",
+    };
+    format!(r#"Bearer error="invalid_token", error_description="{description}""#)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bearer_invalid_token_challenge_flags_expiry_specifically() {
+        assert_eq!(
+            bearer_invalid_token_challenge(&TokenError::Expired),
+            r#"Bearer error="invalid_token", error_description="the access token expired""#
+        );
+    }
+
+    #[test]
+    fn bearer_invalid_token_challenge_is_generic_for_other_variants() {
+        let generic =
+            r#"Bearer error="invalid_token", error_description="the access token is invalid""#;
+        assert_eq!(
+            bearer_invalid_token_challenge(&TokenError::SignatureInvalid),
+            generic
+        );
+        assert_eq!(
+            bearer_invalid_token_challenge(&TokenError::InvalidIssuer),
+            generic
+        );
+        assert_eq!(
+            bearer_invalid_token_challenge(&TokenError::InvalidAudience),
+            generic
+        );
+        assert_eq!(
+            bearer_invalid_token_challenge(&TokenError::NotYetValid),
+            generic
+        );
+        assert_eq!(
+            bearer_invalid_token_challenge(&TokenError::IssuedInFuture),
+            generic
+        );
+        assert_eq!(
+            bearer_invalid_token_challenge(&TokenError::MissingKid),
+            generic
+        );
+    }
 }
 
 /// Cache-aside JWKS load: each Fastly Compute invocation starts with no
