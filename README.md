@@ -223,7 +223,7 @@ than being orchestrated through `sirosid-dev` (see
 
 | app | file | region(s) | public? |
 |---|---|---|---|
-| `siros-status-service-as` | `fly.as.toml` | `iad` | `*.fly.dev` only |
+| `siros-status-service-as` | `fly.as.toml` | `iad` | **`auth.t.status.siros.org`** |
 | `siros-status-service-ingestion-iad` | `fly.ingestion.iad.toml` | `iad` | internal only |
 | `siros-status-service-ingestion-fra` | `fly.ingestion.fra.toml` | `fra` | internal only |
 | `siros-status-service-verifier` | `fly.verifier.toml` | `iad` | **`lists.t.status.siros.org`** |
@@ -265,6 +265,13 @@ fly redis create --name siros-status-service-redis-iad --region iad --no-replica
 fly redis create --name siros-status-service-redis-fra --region fra --no-replicas
 # fly redis create prints each connection URL once, at creation time — save both.
 
+fly certs add auth.t.status.siros.org -a siros-status-service-as
+# fly.as.toml's BASE_URL must match this domain — it drives the `iss`
+# claim on every issued access token and the required `aud` on incoming
+# client assertions, and fly.ingress.toml / each fly.ingestion.<region>.toml
+# hardcode this same domain as AS_JWKS_URL/ACCESS_TOKEN_ISSUER, so all four
+# files agree before any of them are deployed.
+
 STATUSLIST_SIGNING_KEY_PEM="$(openssl ecparam -name prime256v1 -genkey -noout)"
 fly secrets set -a siros-status-service-as AS_SIGNING_KEY_PEM="$(openssl ecparam -name prime256v1 -genkey -noout)"
 fly secrets set -a siros-status-service-ingestion-iad SIGNING_KEY_PEM="$STATUSLIST_SIGNING_KEY_PEM" REDIS_URL="<iad redis URL>"
@@ -282,13 +289,13 @@ fly deploy -c fly.ingestion.fra.toml
 fly deploy -c fly.verifier.toml
 fly deploy -c fly.ingress.toml
 
-# -ingress starts single-region (primary_region above); add the second
-# region and scale to it explicitly:
-fly regions add fra -a siros-status-service-ingress
-fly scale count 2 -a siros-status-service-ingress --region iad,fra
+# -ingress starts single-region (primary_region above); `fly regions add`
+# is deprecated — add the second region's machines directly:
+fly scale count 2 -a siros-status-service-ingress --region fra
 
 # Custom domains — one-time per app, then follow each command's printed
-# DNS instructions:
+# DNS instructions (auth.t.status.siros.org is added earlier, above,
+# since -as's BASE_URL must already match it before -as is deployed):
 fly certs add api.t.status.siros.org -a siros-status-service-ingress
 fly certs add lists.t.status.siros.org -a siros-status-service-verifier
 ```

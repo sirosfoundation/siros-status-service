@@ -35,8 +35,8 @@ primary_region = "iad"
 
 [env]
   HTTP_ADDR = ":8080"
-  AS_JWKS_URL = "https://siros-status-service-as.fly.dev/.well-known/jwks.json"
-  ACCESS_TOKEN_ISSUER = "https://siros-status-service-as.fly.dev"
+  AS_JWKS_URL = "https://auth.t.status.siros.org/.well-known/jwks.json"
+  ACCESS_TOKEN_ISSUER = "https://auth.t.status.siros.org"
   # shard_id -> that shard's ingestion-service base URL (docs/design.md
   # §15.5/§15.6/§18) — every region of THIS app carries the same map, so
   # either shard is reachable regardless of which region a request lands

@@ -15,6 +15,18 @@
 # SHARD_BACKENDS, ...) are hardcoded as plain env vars in each file — no
 # dependency-injection/render step needed.
 #
+# Custom domain: auth.t.status.siros.org (docs/design.md §18 originally
+# deferred this — cmd/as kept its bare *.fly.dev hostname while that
+# stayed "a real open question worth deciding separately" — now decided).
+# BASE_URL above drives both the `iss` claim on every issued access token
+# and the required `aud` on incoming client assertions, so every consumer
+# that hardcodes the AS's identity (fly.ingress.toml's and each
+# fly.ingestion.<region>.toml's AS_JWKS_URL/ACCESS_TOKEN_ISSUER) must be
+# updated and redeployed in the same pass as this one, not independently.
+# One-time setup:
+#   fly certs add auth.t.status.siros.org -a siros-status-service-as
+# then follow the printed DNS instructions.
+#
 # Required secrets before first deploy:
 #   fly secrets set -a siros-status-service-as \
 #     DATABASE_URL="postgres://...shared with every -ingestion-<region> and -verifier..." \
@@ -27,7 +39,7 @@ primary_region = "iad"
 
 [env]
   HTTP_ADDR = ":8080"
-  BASE_URL = "https://siros-status-service-as.fly.dev"
+  BASE_URL = "https://auth.t.status.siros.org"
   # One shard per region (docs/design.md §18) — AssignOrLookup round-robins
   # new issuers across these two, sticky thereafter. Add a region here (and
   # a matching fly.ingestion.<region>.toml + fly.ingress.<region>.toml pair)

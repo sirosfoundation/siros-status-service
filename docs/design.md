@@ -950,11 +950,18 @@ not production):
   list's real public identity: what `internal/publisher` signs into each
   StatusListToken's `sub` claim, and what every shard's `BASE_URL`
   constructs `POST /allocate`'s `list_url` response from.
-- `cmd/as` deliberately keeps its bare `*.fly.dev` hostname for now —
-  token issuance (`POST /token`) is a lower-frequency, less "branded
-  public API surface" concern than allocate/status/lists, and giving it
-  its own domain (e.g. `auth.t.status.siros.org`) is a real open question
-  worth deciding separately, not bundled into this pass.
+- `auth.t.status.siros.org` → `siros-status-service-as` — decided:
+  `cmd/as` initially kept its bare `*.fly.dev` hostname (token issuance
+  was judged a lower-frequency, less "branded public API surface"
+  concern than allocate/status/lists), but that split two-hostname
+  experience onto issuers in practice (the published quickstart's
+  `/token` example and `ingress-router`'s `/allocate`/`/status` routes
+  looked like one API but weren't), so `cmd/as` got its own domain too.
+  `BASE_URL` on `-as` (which drives both the `iss` claim on every issued
+  access token and the required `aud` on incoming client assertions) and
+  every consumer that hardcodes the AS's identity (`-ingress`'s and each
+  `-ingestion-<region>`'s `AS_JWKS_URL`/`ACCESS_TOKEN_ISSUER`) must move
+  together, not independently.
 
 **Shard assignment stays round-robin for now** (`internal/as/shard.go`'s
 existing `AssignOrLookup`, unchanged code) — geography-aware assignment

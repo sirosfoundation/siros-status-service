@@ -12,8 +12,8 @@ primary_region = "fra"
   HTTP_ADDR = ":8080"
   BASE_URL = "https://lists.t.status.siros.org"
   SHARD_ID = "fra"
-  AS_JWKS_URL = "https://siros-status-service-as.fly.dev/.well-known/jwks.json"
-  ACCESS_TOKEN_ISSUER = "https://siros-status-service-as.fly.dev"
+  AS_JWKS_URL = "https://auth.t.status.siros.org/.well-known/jwks.json"
+  ACCESS_TOKEN_ISSUER = "https://auth.t.status.siros.org"
   # §19: this is the test deployment — deliberately tight, not a value
   # meant to generalize to a real deployment's actual credential lifetimes.
   MAX_EXPIRY = "24h"
