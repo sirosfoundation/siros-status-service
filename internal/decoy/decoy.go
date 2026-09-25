@@ -55,6 +55,7 @@ import (
 	"time"
 
 	"github.com/sirosfoundation/siros-status-service/internal/allocator"
+	"github.com/sirosfoundation/siros-status-service/internal/metrics"
 	"github.com/sirosfoundation/siros-status-service/internal/publisher"
 	"github.com/sirosfoundation/siros-status-service/internal/statuslist"
 	"github.com/sirosfoundation/siros-status-service/internal/store"
@@ -173,6 +174,7 @@ func (n *Noiser) sweepList(ctx context.Context, lm *store.ListMeta) error {
 		if _, err := n.bitmaps.SetStatus(ctx, lm.ID, byteIndex, bitOffset, lm.Bits, byte(next)); err != nil {
 			return err
 		}
+		metrics.IngestionDecoyFlipsTotal.WithLabelValues(n.shardID).Inc()
 		dirty = true
 	}
 

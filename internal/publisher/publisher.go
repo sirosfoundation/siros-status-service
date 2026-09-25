@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sirosfoundation/siros-status-service/internal/metrics"
 	"github.com/sirosfoundation/siros-status-service/internal/statuslist"
 	"github.com/sirosfoundation/siros-status-service/internal/store"
 )
@@ -128,8 +129,10 @@ func (p *Publisher) PublishIfStale(ctx context.Context, lm *store.ListMeta, ttlS
 	cached, cacheOK := p.cache[lm.ID]
 	p.mu.RUnlock()
 	if cacheOK && cached.Version == liveVersion && cached.TTL == ttlSeconds {
+		metrics.PublisherRebuildsTotal.WithLabelValues("cache_hit").Inc()
 		return cached, nil
 	}
+	metrics.PublisherRebuildsTotal.WithLabelValues("rebuilt").Inc()
 
 	byteLen := int64((lm.Size*uint64(lm.Bits) + 7) / 8)
 	raw, err := bitmaps.Snapshot(ctx, lm.ID, byteLen)

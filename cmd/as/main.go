@@ -15,10 +15,14 @@ import (
 	"github.com/sirosfoundation/siros-status-service/internal/accesstoken"
 	"github.com/sirosfoundation/siros-status-service/internal/as"
 	"github.com/sirosfoundation/siros-status-service/internal/config"
+	"github.com/sirosfoundation/siros-status-service/internal/metrics"
 	"github.com/sirosfoundation/siros-status-service/internal/trust"
 )
 
-const httpShutdownTimeout = 10 * time.Second
+const (
+	httpShutdownTimeout = 10 * time.Second
+	poolStatsInterval   = 15 * time.Second
+)
 
 func main() {
 	if err := run(); err != nil {
@@ -56,6 +60,7 @@ func run() error {
 		return err
 	}
 	defer shards.Close()
+	go metrics.WatchPostgresPool(ctx, poolStatsInterval, shards.Stat)
 
 	km := accesstoken.NewKeyManager(cfg.SigningKey, cfg.SigningKeyID)
 	srv := as.New(cfg, km, evaluator, shards)

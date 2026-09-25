@@ -14,11 +14,14 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"time"
 
 	gojosejwt "github.com/go-jose/go-jose/v4/jwt"
 	golangjwt "github.com/golang-jwt/jwt/v5"
 
 	tokenauthvalidator "github.com/sirosfoundation/go-tokenauth/validator"
+
+	"github.com/sirosfoundation/siros-status-service/internal/metrics"
 )
 
 // Router verifies inbound requests and reverse-proxies them to the
@@ -68,6 +71,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		// RFC 6750 §3: the request itself is malformed (no bearer
 		// token was even presented), as distinct from a bearer token
 		// that was presented but rejected.
+		metrics.IngressProxyTotal.WithLabelValues("", "missing_token").Inc()
 		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_request"`)
 		http.Error(w, "missing or malformed Authorization header", http.StatusUnauthorized)
 		return
@@ -75,6 +79,11 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	result, err := r.validator.Validate(req.Context(), token)
 	if err != nil {
+		result := "invalid_token"
+		if errors.Is(err, gojosejwt.ErrExpired) || errors.Is(err, golangjwt.ErrTokenExpired) {
+			result = "expired_token"
+		}
+		metrics.IngressProxyTotal.WithLabelValues("", result).Inc()
 		w.Header().Set("WWW-Authenticate", bearerInvalidTokenChallenge(err))
 		http.Error(w, "invalid access token", http.StatusUnauthorized)
 		return
@@ -82,10 +91,15 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	proxy, ok := r.proxies[result.TenantID]
 	if !ok {
+		metrics.IngressProxyTotal.WithLabelValues(result.TenantID, "unknown_shard").Inc()
 		http.Error(w, "no backend configured for this token's shard", http.StatusBadGateway)
 		return
 	}
+
+	start := time.Now()
 	proxy.ServeHTTP(w, req)
+	metrics.IngressProxyDuration.WithLabelValues(result.TenantID).Observe(time.Since(start).Seconds())
+	metrics.IngressProxyTotal.WithLabelValues(result.TenantID, "proxied").Inc()
 }
 
 // bearerInvalidTokenChallenge builds the RFC 6750 §3 WWW-Authenticate

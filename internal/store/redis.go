@@ -154,3 +154,10 @@ func (s *BitmapStore) Purge(ctx context.Context, listID string) error {
 	}
 	return nil
 }
+
+// Stat returns this store's underlying Redis connection pool's current
+// stats — a point-in-time snapshot for periodic metrics polling (see
+// internal/metrics.UpdateRedisPoolStats), not per-operation.
+func (s *BitmapStore) Stat() *redis.PoolStats {
+	return s.rdb.PoolStats()
+}

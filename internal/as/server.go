@@ -10,6 +10,7 @@ import (
 
 	"github.com/sirosfoundation/siros-status-service/internal/accesstoken"
 	"github.com/sirosfoundation/siros-status-service/internal/config"
+	"github.com/sirosfoundation/siros-status-service/internal/metrics"
 	"github.com/sirosfoundation/siros-status-service/internal/trust"
 )
 
@@ -26,11 +27,12 @@ func New(cfg *config.ASConfig, km *accesstoken.KeyManager, evaluator trust.Evalu
 
 func (s *Server) Router() *gin.Engine {
 	r := gin.New()
-	r.Use(gin.Recovery())
+	r.Use(gin.Recovery(), metrics.GinMiddleware())
 
 	r.GET("/healthz", s.handleHealthz)
 	r.GET("/.well-known/jwks.json", s.handleJWKS)
 	r.POST("/token", s.handleToken)
+	r.GET("/metrics", gin.WrapH(metrics.Handler()))
 
 	return r
 }

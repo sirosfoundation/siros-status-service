@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/sirosfoundation/siros-status-service/internal/metrics"
 	"github.com/sirosfoundation/siros-status-service/internal/store"
 )
 
@@ -43,6 +44,7 @@ func (s *Sweeper) Sweep(ctx context.Context) error {
 		if err := s.meta.Archive(ctx, lm.ID); err != nil {
 			return err
 		}
+		metrics.IngestionGCArchivedTotal.WithLabelValues(lm.ShardID).Inc()
 		slog.Info("gc: archived list", "list_id", lm.ID, "max_exp", lm.MaxExp)
 	}
 
@@ -57,6 +59,7 @@ func (s *Sweeper) Sweep(ctx context.Context) error {
 		if err := s.meta.MarkPurged(ctx, lm.ID); err != nil {
 			return err
 		}
+		metrics.IngestionGCPurgedTotal.WithLabelValues(lm.ShardID).Inc()
 		slog.Info("gc: purged list bitmap", "list_id", lm.ID, "archived_at", lm.ArchivedAt)
 	}
 

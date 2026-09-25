@@ -13,6 +13,7 @@ import (
 	tokenauthvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 
 	"github.com/sirosfoundation/siros-status-service/internal/config"
+	"github.com/sirosfoundation/siros-status-service/internal/metrics"
 	"github.com/sirosfoundation/siros-status-service/internal/pool"
 	"github.com/sirosfoundation/siros-status-service/internal/publisher"
 	"github.com/sirosfoundation/siros-status-service/internal/store"
@@ -43,9 +44,10 @@ const (
 
 func (s *Server) Router() *gin.Engine {
 	r := gin.New()
-	r.Use(gin.Recovery())
+	r.Use(gin.Recovery(), metrics.GinMiddleware())
 
 	r.GET("/healthz", s.handleHealthz)
+	r.GET("/metrics", gin.WrapH(metrics.Handler()))
 
 	authed := r.Group("/", tokengin.TokenAuth(s.validator), requireShard(s.cfg.ShardID))
 	authed.POST("/allocate", tokengin.MustHaveTAC(tacAllocate), s.handleAllocate)

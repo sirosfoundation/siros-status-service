@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/sirosfoundation/siros-status-service/internal/allocator"
+	"github.com/sirosfoundation/siros-status-service/internal/metrics"
 	"github.com/sirosfoundation/siros-status-service/internal/store"
 )
 
@@ -90,6 +91,8 @@ func NewManager(meta *store.MetaStore, bitmaps *store.BitmapStore, shardID strin
 // they age out or fill up like any other pool member). Worth revisiting
 // with an advisory lock only if this stops being true at higher scale.
 func (m *Manager) EnsureHealthy(ctx context.Context) error {
+	metrics.IngestionPoolWidthTarget.WithLabelValues(m.ShardID).Set(float64(m.Width))
+
 	active, err := m.meta.ActiveLists(ctx, m.ShardID)
 	if err != nil {
 		return err
@@ -101,6 +104,7 @@ func (m *Manager) EnsureHealthy(ctx context.Context) error {
 			if err := m.meta.Freeze(ctx, lm.ID); err != nil {
 				return err
 			}
+			metrics.IngestionRotationsTotal.WithLabelValues(m.ShardID, "age").Inc()
 			slog.Info("pool: froze list past max age", "list_id", lm.ID, "age", time.Since(lm.CreatedAt))
 			continue
 		}
@@ -114,6 +118,8 @@ func (m *Manager) EnsureHealthy(ctx context.Context) error {
 		}
 		remaining = append(remaining, lm)
 	}
+
+	metrics.IngestionPoolActiveLists.WithLabelValues(m.ShardID).Set(float64(len(remaining)))
 	return nil
 }
 

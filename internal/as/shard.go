@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/sirosfoundation/siros-status-service/internal/metrics"
 	"github.com/sirosfoundation/siros-status-service/internal/pgutil"
 )
 
@@ -46,6 +47,13 @@ func NewShardAssigner(ctx context.Context, dsn string, shards []string) (*ShardA
 
 func (a *ShardAssigner) Close() { a.pool.Close() }
 
+// Stat returns this assigner's underlying Postgres connection pool's
+// current stats — a point-in-time snapshot for periodic metrics polling
+// (see internal/metrics.UpdatePostgresPoolStats), not per-operation.
+func (a *ShardAssigner) Stat() *pgxpool.Stat {
+	return a.pool.Stat()
+}
+
 // AssignOrLookup returns issuerID's shard, assigning one on first call.
 // The candidate for a brand-new issuer is a deterministic hash of their
 // ID mod the configured shard count — not a shared round-robin counter —
@@ -55,6 +63,7 @@ func (a *ShardAssigner) AssignOrLookup(ctx context.Context, issuerID string) (st
 	var shardID string
 	err := a.pool.QueryRow(ctx, `SELECT shard_id FROM issuer_shard WHERE issuer_id = $1`, issuerID).Scan(&shardID)
 	if err == nil {
+		metrics.ASShardAssignmentsTotal.WithLabelValues(shardID, "false").Inc()
 		return shardID, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
@@ -78,6 +87,7 @@ func (a *ShardAssigner) AssignOrLookup(ctx context.Context, issuerID string) (st
 	if err := a.pool.QueryRow(ctx, `SELECT shard_id FROM issuer_shard WHERE issuer_id = $1`, issuerID).Scan(&shardID); err != nil {
 		return "", fmt.Errorf("as: read back assigned shard for %s: %w", issuerID, err)
 	}
+	metrics.ASShardAssignmentsTotal.WithLabelValues(shardID, "true").Inc()
 	return shardID, nil
 }
 

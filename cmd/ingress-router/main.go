@@ -15,6 +15,7 @@ import (
 
 	"github.com/sirosfoundation/siros-status-service/internal/config"
 	"github.com/sirosfoundation/siros-status-service/internal/ingress"
+	"github.com/sirosfoundation/siros-status-service/internal/metrics"
 )
 
 const httpShutdownTimeout = 10 * time.Second
@@ -53,6 +54,7 @@ func run() error {
 		w.WriteHeader(200)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
+	mux.Handle("/metrics", metrics.Handler())
 	mux.Handle("/", router)
 
 	httpSrv := &http.Server{Addr: cfg.HTTPAddr, Handler: mux}

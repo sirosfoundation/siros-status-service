@@ -5,6 +5,7 @@ import (
 
 	"github.com/sirosfoundation/siros-status-service/internal/accesstoken"
 	"github.com/sirosfoundation/siros-status-service/internal/clientassertion"
+	"github.com/sirosfoundation/siros-status-service/internal/metrics"
 	"github.com/sirosfoundation/siros-status-service/internal/trust"
 )
 
@@ -26,21 +27,25 @@ type tokenResponse struct {
 // authentication — there's no separate registered client secret.
 func (s *Server) handleToken(c *gin.Context) {
 	if c.PostForm("grant_type") != grantTypeClientCredentials {
+		metrics.ASTokenIssuanceTotal.WithLabelValues("unsupported_grant_type").Inc()
 		c.JSON(400, gin.H{"error": "unsupported_grant_type"})
 		return
 	}
 	if c.PostForm("client_assertion_type") != clientAssertionTypeJWTBearer {
+		metrics.ASTokenIssuanceTotal.WithLabelValues("invalid_request").Inc()
 		c.JSON(400, gin.H{"error": "invalid_request", "error_description": "client_assertion_type must be " + clientAssertionTypeJWTBearer})
 		return
 	}
 	assertion := c.PostForm("client_assertion")
 	if assertion == "" {
+		metrics.ASTokenIssuanceTotal.WithLabelValues("invalid_request").Inc()
 		c.JSON(400, gin.H{"error": "invalid_request", "error_description": "client_assertion is required"})
 		return
 	}
 
 	result, err := clientassertion.Verify(assertion, s.cfg.BaseURL+"/token")
 	if err != nil {
+		metrics.ASTokenIssuanceTotal.WithLabelValues("invalid_client").Inc()
 		c.JSON(401, gin.H{"error": "invalid_client", "error_description": "client assertion did not verify"})
 		return
 	}
@@ -56,6 +61,7 @@ func (s *Server) handleToken(c *gin.Context) {
 	case len(result.X5C) > 0:
 		cred = trust.CredentialFromX5C(result.X5C)
 	default:
+		metrics.ASTokenIssuanceTotal.WithLabelValues("invalid_client").Inc()
 		c.JSON(401, gin.H{"error": "invalid_client", "error_description": "client assertion carried no usable proof of possession"})
 		return
 	}
@@ -63,16 +69,19 @@ func (s *Server) handleToken(c *gin.Context) {
 	ctx := c.Request.Context()
 	decision, err := s.evaluator.Evaluate(ctx, result.IssuerID, cred)
 	if err != nil {
+		metrics.ASTokenIssuanceTotal.WithLabelValues("server_error").Inc()
 		c.JSON(500, gin.H{"error": "server_error", "error_description": "trust evaluation failed"})
 		return
 	}
 	if !decision.Trusted {
+		metrics.ASTokenIssuanceTotal.WithLabelValues("invalid_client").Inc()
 		c.JSON(401, gin.H{"error": "invalid_client", "error_description": "key is not trusted: " + decision.Reason})
 		return
 	}
 
 	shardID, err := s.shards.AssignOrLookup(ctx, result.IssuerID)
 	if err != nil {
+		metrics.ASTokenIssuanceTotal.WithLabelValues("server_error").Inc()
 		c.JSON(500, gin.H{"error": "server_error", "error_description": "shard assignment failed"})
 		return
 	}
@@ -91,9 +100,11 @@ func (s *Server) handleToken(c *gin.Context) {
 		TTL: expiresIn,
 	})
 	if err != nil {
+		metrics.ASTokenIssuanceTotal.WithLabelValues("server_error").Inc()
 		c.JSON(500, gin.H{"error": "server_error", "error_description": "could not mint token"})
 		return
 	}
 
+	metrics.ASTokenIssuanceTotal.WithLabelValues("success").Inc()
 	c.JSON(200, tokenResponse{AccessToken: token, TokenType: "Bearer", ExpiresIn: int64(expiresIn.Seconds())})
 }

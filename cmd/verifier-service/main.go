@@ -16,12 +16,16 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/sirosfoundation/siros-status-service/internal/config"
+	"github.com/sirosfoundation/siros-status-service/internal/metrics"
 	"github.com/sirosfoundation/siros-status-service/internal/publisher"
 	"github.com/sirosfoundation/siros-status-service/internal/store"
 	"github.com/sirosfoundation/siros-status-service/internal/verifier"
 )
 
-const httpShutdownTimeout = 10 * time.Second
+const (
+	httpShutdownTimeout = 10 * time.Second
+	poolStatsInterval   = 15 * time.Second
+)
 
 func main() {
 	if err := run(); err != nil {
@@ -50,7 +54,9 @@ func run() error {
 			return err
 		}
 		defer func() { _ = rdb.Close() }()
-		bitmapsByShard[shardID] = store.NewBitmapStore(rdb)
+		bs := store.NewBitmapStore(rdb)
+		bitmapsByShard[shardID] = bs
+		go metrics.WatchRedisPool(ctx, poolStatsInterval, shardID, bs.Stat)
 	}
 	if len(bitmapsByShard) == 0 {
 		slog.Warn("verifier-service: no shards configured in SHARD_REDIS_URLS")
@@ -61,6 +67,7 @@ func run() error {
 		return err
 	}
 	defer meta.Close()
+	go metrics.WatchPostgresPool(ctx, poolStatsInterval, meta.Stat)
 
 	pub := publisher.New(bitmapsByShard, meta, cfg.SigningKey, cfg.SigningKeyID, cfg.BaseURL)
 	srv := verifier.New(cfg, meta, pub)

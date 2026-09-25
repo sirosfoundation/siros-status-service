@@ -18,12 +18,16 @@ import (
 	"github.com/sirosfoundation/siros-status-service/internal/decoy"
 	"github.com/sirosfoundation/siros-status-service/internal/gc"
 	"github.com/sirosfoundation/siros-status-service/internal/ingestion"
+	"github.com/sirosfoundation/siros-status-service/internal/metrics"
 	"github.com/sirosfoundation/siros-status-service/internal/pool"
 	"github.com/sirosfoundation/siros-status-service/internal/publisher"
 	"github.com/sirosfoundation/siros-status-service/internal/store"
 )
 
-const httpShutdownTimeout = 10 * time.Second
+const (
+	httpShutdownTimeout = 10 * time.Second
+	poolStatsInterval   = 15 * time.Second
+)
 
 func main() {
 	if err := run(); err != nil {
@@ -57,6 +61,9 @@ func run() error {
 		return err
 	}
 	defer meta.Close()
+
+	go metrics.WatchPostgresPool(ctx, poolStatsInterval, meta.Stat)
+	go metrics.WatchRedisPool(ctx, poolStatsInterval, cfg.ShardID, bitmaps.Stat)
 
 	// go-tokenauth's own validator + jwks.Fetcher (background-refreshed,
 	// fully offline per request) — see docs/design.md §15.2/§15.3 for why

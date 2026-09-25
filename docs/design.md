@@ -1066,3 +1066,60 @@ populated) to carry either proof type through — a breaking change to the
 interface, not just an addition, since a single hardcoded assumption
 ("it's always a jwk") no longer holds anywhere in the call chain from
 `cmd/as`'s `handleToken` down to the evaluator.
+
+## 21. Observability: Prometheus metrics + Grafana Cloud, cross-cluster capacity planning
+
+**The goal:** measure and visualize real usage for capacity planning —
+explicitly across more than just this one test deployment. This shaped
+two decisions that would look unnecessary for a single-deployment tool:
+
+**No `service`, `shard`-as-deployment-identity, or `cluster` label baked
+into any metric name or its label set in `internal/metrics`.** All four
+binaries emit the exact same metric names with the exact same label
+schemas, deployment-agnostic. Which binary/instance/region a series came
+from is Prometheus's own scrape-time `job`/`instance` labels; which
+*cluster* (test today, other deployments later) is an **external label**
+the scraper stamps on before remote-writing to Grafana Cloud, not
+something the application code knows about. Getting this wrong (e.g.
+hardcoding `cluster="test"` inside the Go binaries) would mean every
+future deployment either needs a code change and rebuild just to change
+a label value, or ships confused about its own identity — the opposite
+of what "compare capacity across clusters" needs.
+
+**`shard_id` labels are the one deliberate exception**, present on every
+ingestion/decoy/GC/rotation/Redis-pool metric even though, for
+`cmd/ingestion-service` (one shard per process), the scrape target's own
+`job`/`instance` label would already distinguish shards just as well.
+Two reasons this redundancy is worth it anyway: (1) `cmd/verifier-service`
+is a *single* process serving every configured shard's reads
+(`SHARD_REDIS_URLS`), where per-shard Redis pool saturation genuinely
+can't be recovered from `job`/`instance` alone; consistency across both
+services' metrics matters more than removing a harmless duplicate label
+from one of them. (2) A future cluster's own scrape/job-naming
+convention is not this repo's to control — a label baked into the metric
+itself is portable across whatever naming scheme each cluster's own
+Alloy config happens to use, `job` labels are not.
+
+**Shipping architecture:** each binary exposes `GET /metrics`
+(`internal/metrics`, `prometheus/client_golang`) on its existing HTTP
+port — no separate metrics port, since Fly's per-app private networking
+(`<app>.flycast`) already keeps it off the public internet without one.
+A single additional Fly app (`fly.metrics.toml`, Grafana Alloy's own
+public image, no custom build) privately scrapes all five apps'
+`.flycast` addresses and remote-writes to Grafana Cloud, stamping
+`cluster` as its one external label. This is a genuinely separate
+concern from the ingress-router/shard-backend routing discussion
+elsewhere in this doc (which reaches shard backends over their *public*
+hostnames, for unrelated reasons) — nothing about that decision applies
+to metrics scraping, which has no reason not to use Fly's private
+networking.
+
+**Deliberately not done here:** distributed tracing (structured logs
+plus a shared correlation ID cover debugging needs at this scale more
+cheaply); a metrics-driven autoscaler (Fly's own concurrency-based
+autoscaling is the near-term lever; a real capacity-planning dashboard
+across clusters is a prerequisite for deciding whether a fancier
+autoscaler is ever worth building, not something to build alongside it);
+access control on `/metrics` itself (it rides the same public hostname
+as everything else on a given app today — an accepted gap for a test
+deployment, not something to carry into a production posture unreviewed).

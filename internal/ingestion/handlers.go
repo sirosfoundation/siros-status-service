@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/sirosfoundation/siros-status-service/internal/allocator"
+	"github.com/sirosfoundation/siros-status-service/internal/metrics"
 	"github.com/sirosfoundation/siros-status-service/internal/statuslist"
 	"github.com/sirosfoundation/siros-status-service/internal/store"
 )
@@ -62,6 +63,7 @@ func (s *Server) handleAllocate(c *gin.Context) {
 	case exp.IsZero():
 		exp = maxExp
 	case exp.After(maxExp):
+		metrics.IngestionAllocateTotal.WithLabelValues(s.cfg.ShardID, "error").Inc()
 		c.JSON(400, gin.H{"error": fmt.Sprintf("exp exceeds the maximum allowed expiration of %s", maxExp.Format(time.RFC3339))})
 		return
 	}
@@ -72,16 +74,19 @@ func (s *Server) handleAllocate(c *gin.Context) {
 	for range maxAllocateAttempts {
 		lm, err := s.pool.PickForAllocation(ctx)
 		if err != nil {
+			metrics.IngestionAllocateTotal.WithLabelValues(s.cfg.ShardID, "error").Inc()
 			c.JSON(500, gin.H{"error": "could not obtain an active list"})
 			return
 		}
 		if lm == nil {
+			metrics.IngestionAllocateTotal.WithLabelValues(s.cfg.ShardID, "error").Inc()
 			c.JSON(503, gin.H{"error": "no active list available"})
 			return
 		}
 
 		alloc, err := allocator.New(lm.FPEKey, lm.Size)
 		if err != nil {
+			metrics.IngestionAllocateTotal.WithLabelValues(s.cfg.ShardID, "error").Inc()
 			c.JSON(500, gin.H{"error": "internal allocator error"})
 			return
 		}
@@ -91,6 +96,7 @@ func (s *Server) handleAllocate(c *gin.Context) {
 			if errors.Is(err, store.ErrListFull) {
 				continue // §8.1: try again against a freshly-queried pool
 			}
+			metrics.IngestionAllocateTotal.WithLabelValues(s.cfg.ShardID, "error").Inc()
 			c.JSON(500, gin.H{"error": "could not allocate an index"})
 			return
 		}
@@ -112,6 +118,7 @@ func (s *Server) handleAllocate(c *gin.Context) {
 		}
 		s.pub.MarkDirty(lm.ID, s.cfg.DefaultTTLSeconds)
 
+		metrics.IngestionAllocateTotal.WithLabelValues(s.cfg.ShardID, "success").Inc()
 		c.JSON(201, allocateResponse{
 			ListURL: s.cfg.BaseURL + "/lists/" + lm.ID,
 			Index:   idx,
@@ -120,6 +127,7 @@ func (s *Server) handleAllocate(c *gin.Context) {
 		return
 	}
 
+	metrics.IngestionAllocateTotal.WithLabelValues(s.cfg.ShardID, "error").Inc()
 	c.JSON(503, gin.H{"error": "could not allocate after retrying against the active pool; try again shortly"})
 }
 

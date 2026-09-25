@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/sirosfoundation/siros-status-service/internal/metrics"
 	"github.com/sirosfoundation/siros-status-service/internal/pgutil"
 )
 
@@ -124,6 +125,13 @@ func NewMetaStore(ctx context.Context, dsn string) (*MetaStore, error) {
 }
 
 func (m *MetaStore) Close() { m.pool.Close() }
+
+// Stat returns this store's underlying Postgres connection pool's
+// current stats — a point-in-time snapshot for periodic metrics polling
+// (see internal/metrics.UpdatePostgresPoolStats), not per-operation.
+func (m *MetaStore) Stat() *pgxpool.Stat {
+	return m.pool.Stat()
+}
 
 // CreateList inserts a new list row in ACTIVE state, owned by shardID
 // (docs/design.md §15.5; pass "default" for single-shard deployments).
@@ -353,6 +361,9 @@ func (m *MetaStore) ReserveCursorAndRecord(ctx context.Context, listID, issuerID
 			return 0, ErrListFull
 		}
 		return 0, fmt.Errorf("store: reserve cursor: %w", err)
+	}
+	if cursor+1 >= size {
+		metrics.IngestionRotationsTotal.WithLabelValues(shardID, "full").Inc()
 	}
 
 	idx, err := deriveIndex(uint64(cursor))

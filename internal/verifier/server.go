@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/sirosfoundation/siros-status-service/internal/config"
+	"github.com/sirosfoundation/siros-status-service/internal/metrics"
 	"github.com/sirosfoundation/siros-status-service/internal/publisher"
 	"github.com/sirosfoundation/siros-status-service/internal/store"
 )
@@ -24,10 +25,11 @@ func New(cfg *config.VerifierConfig, meta *store.MetaStore, pub *publisher.Publi
 
 func (s *Server) Router() *gin.Engine {
 	r := gin.New()
-	r.Use(gin.Recovery())
+	r.Use(gin.Recovery(), metrics.GinMiddleware())
 
 	r.GET("/healthz", s.handleHealthz)
 	r.GET("/lists/:listID", s.handleGetList)
+	r.GET("/metrics", gin.WrapH(metrics.Handler()))
 
 	return r
 }
