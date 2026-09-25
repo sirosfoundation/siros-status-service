@@ -31,6 +31,7 @@ func mergeResults(results []*workerResult) map[string]*opSummary {
 		"allocate":   {op: "allocate"},
 		"status":     {op: "status"},
 		"accounting": {op: "accounting"},
+		"lifecycle":  {op: "lifecycle"},
 	}
 	for _, r := range results {
 		for op, lat := range r.latency {
@@ -54,7 +55,7 @@ func printReport(results []*workerResult, wallClock time.Duration) {
 
 	fmt.Printf("\n=== load test report (%d issuers, %s wall clock) ===\n", len(results), wallClock.Round(time.Millisecond))
 	fmt.Printf("%-12s %8s %8s %10s %10s %10s %10s %10s\n", "op", "ok", "errors", "rps", "p50", "p90", "p99", "max")
-	for _, op := range []string{"allocate", "status", "accounting"} {
+	for _, op := range []string{"allocate", "status", "accounting", "lifecycle"} {
 		s := summaries[op]
 		rps := float64(s.ok) / wallClock.Seconds()
 		fmt.Printf("%-12s %8d %8d %10.1f %10s %10s %10s %10s\n",
@@ -67,5 +68,25 @@ func printReport(results []*workerResult, wallClock time.Duration) {
 	}
 	if totalSkipped > 0 {
 		fmt.Printf("(%d 'status' attempts skipped — issuer had nothing allocated yet)\n", totalSkipped)
+	}
+
+	printLifecycleMismatches(results)
+}
+
+// printLifecycleMismatches surfaces every lifecycle.go finding: a case
+// where the verifier's own published list disagreed with what this
+// harness had just written through ingress. Printed unconditionally
+// (even a zero count) so a clean run says so explicitly, the same
+// convention verify.go's decoy-safety check follows.
+func printLifecycleMismatches(results []*workerResult) {
+	total := 0
+	for _, r := range results {
+		total += len(r.mismatches)
+	}
+	fmt.Printf("\n=== lifecycle check: %d mismatches (published list vs. what this run wrote) ===\n", total)
+	for _, r := range results {
+		for _, m := range r.mismatches {
+			fmt.Printf("  MISMATCH %s\n", m)
+		}
 	}
 }

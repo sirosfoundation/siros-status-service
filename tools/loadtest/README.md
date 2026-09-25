@@ -4,13 +4,45 @@ Drives synthetic issuer traffic through a real deployment: mints N
 synthetic issuer identities, gets each a real access token from `cmd/as`
 (RFC 7523 client assertion, matching `internal/clientassertion`'s test
 construction exactly — see `identity.go`), then generates concurrent
-`POST /allocate` / `PATCH /status` / `GET /accounting/me` traffic through
-`cmd/ingress-router` for a configured duration.
+`POST /allocate` / `PATCH /status` / `GET /accounting/me` / lifecycle
+traffic through `cmd/ingress-router` for a configured duration.
 
-This is the issuer-facing **write** path (docs/design.md §15's "Track B"),
-deliberately not `GET /lists/{id}` — that read path sits behind a CDN in
-front of `cmd/verifier-service`, so its load profile is a CDN-sizing
-question, not a question about this service's own code.
+This is primarily the issuer-facing **write** path (docs/design.md §15's
+"Track B"). `GET /lists/{id}` is deliberately not a load-generation target
+on its own — that read path sits behind a CDN in front of
+`cmd/verifier-service`, so its *throughput* profile is a CDN-sizing
+question, not a question about this service's own code. It is exercised,
+though, as part of the `lifecycle` op below — a *correctness* check under
+concurrent write load, not a read-throughput measurement.
+
+## The `lifecycle` op
+
+`-lifecycle-weight` (default 10) adds a fourth traffic-mix op alongside
+allocate/status/accounting: a full, public, end-to-end round trip for one
+synthetic credential — `POST /allocate` → `GET` the resulting `list_url`
+and check the index reads `VALID` → `PATCH /status` to `INVALID` (revoke)
+→ `GET` again and check it now reads `INVALID`. Every step uses the same
+public endpoints a real issuer plus a real relying party would use — no
+backend access, so unlike `-verify` this needs no Postgres/Redis tunnel
+and works identically against the live deployment or the local
+walkthrough.
+
+This is the strongest correctness signal this tool has: `-verify`'s
+decoy-safety check (below) reads the shard's Redis directly, so it can
+catch a bug in `internal/decoy` but would miss a bug in the *publish*
+path itself (`internal/publisher`'s debounce, `PublishIfStale`'s on-
+read rebuild) — a case where the backend state is right but what a real
+verifier actually receives is wrong. The `lifecycle` op reads back
+through the exact same public JWT a relying party fetches, so it catches
+that class of bug too. A disagreement is reported as a `MISMATCH` line,
+separate from the ordinary error count, since "the request succeeded but
+told us the wrong status" is a different, more serious finding than a
+transient HTTP failure.
+
+The JWT's signature is not verified (there is no JWKS endpoint yet for
+the StatusListToken signing key — a real relying-party integration would
+need one; see "Known gaps" in the main README). This checks
+self-consistency, not trust.
 
 ## Usage
 
@@ -84,9 +116,16 @@ tool's own view of what it sent:
 
 ## Limitations
 
-- `-rps` caps total request rate, not the read/write path deliberately
-  left out of scope: `GET /lists/{id}` (docs/design.md §18 — that's a
-  CDN-sizing question, not a question about this service's own code).
+- `-rps` caps how often a new op *starts*, not the requests inside it —
+  one `lifecycle` op is 4 sequential HTTP calls fired back-to-back (they
+  can't be spread out; each depends on the previous one's result), so a
+  lifecycle-heavy mix generates roughly 4x its own op-rate in real
+  requests. Size `-rps` with that in mind, not as a literal HTTP
+  requests/sec figure.
+- `GET /lists/{id}` is only ever exercised via `lifecycle`'s correctness
+  round trip, never as a dedicated read-throughput target — that
+  remains a CDN-sizing question (docs/design.md §18), not something
+  this tool measures.
 - Latencies are collected in memory per worker and merged after the run,
   so very long/very high-issuer-count runs use proportionally more
   memory — fine at the scale this was built and tested at (tens of

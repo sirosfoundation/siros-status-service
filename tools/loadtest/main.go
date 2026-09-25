@@ -29,17 +29,18 @@ import (
 
 func main() {
 	var (
-		asURL          = flag.String("as-url", "http://localhost:8090", "cmd/as base URL")
-		ingressURL     = flag.String("ingress-url", "http://localhost:8094", "cmd/ingress-router base URL — every timed request goes here")
-		numIssuers     = flag.Int("issuers", 50, "number of synthetic issuer identities, each its own goroutine")
-		duration       = flag.Duration("duration", 30*time.Second, "how long to generate load after setup completes")
-		allocWeight    = flag.Float64("allocate-weight", 80, "relative weight of POST /allocate in the traffic mix")
-		statWeight     = flag.Float64("status-weight", 15, "relative weight of PATCH /status in the traffic mix")
-		acctWeight     = flag.Float64("accounting-weight", 5, "relative weight of GET /accounting/me in the traffic mix")
-		rps            = flag.Float64("rps", 25, "total requests/sec across every issuer, combined — a deliberately conservative default: a real shard's Redis is billed per command (docs/design.md §18), and every op here costs several Redis commands downstream, not one. Raise this deliberately, never by removing the cap.")
-		verify         = flag.Bool("verify", false, "after the run, check pool balance and decoy-noise safety directly against postgres/redis")
-		postgresDSN    = flag.String("postgres-dsn", "postgres://postgres:postgres@localhost:5432/statuslist?sslmode=disable", "used only with -verify")
-		shardRedisURLs = flag.String("shard-redis-urls", `{"default":"redis://localhost:6379"}`, "used only with -verify; JSON object of shard_id -> that shard's own Redis URL, the same shape cmd/verifier-service's own SHARD_REDIS_URLS takes — must cover every shard an issuer could have been assigned to, or verify fails loudly rather than silently skipping that shard's allocations")
+		asURL           = flag.String("as-url", "http://localhost:8090", "cmd/as base URL")
+		ingressURL      = flag.String("ingress-url", "http://localhost:8094", "cmd/ingress-router base URL — every timed request goes here")
+		numIssuers      = flag.Int("issuers", 50, "number of synthetic issuer identities, each its own goroutine")
+		duration        = flag.Duration("duration", 30*time.Second, "how long to generate load after setup completes")
+		allocWeight     = flag.Float64("allocate-weight", 80, "relative weight of POST /allocate in the traffic mix")
+		statWeight      = flag.Float64("status-weight", 15, "relative weight of PATCH /status in the traffic mix")
+		acctWeight      = flag.Float64("accounting-weight", 5, "relative weight of GET /accounting/me in the traffic mix")
+		lifecycleWeight = flag.Float64("lifecycle-weight", 10, "relative weight of the full allocate/verify/revoke/verify end-to-end check (lifecycle.go) in the traffic mix — the only op that reads back through the public verifier, so it's how this tool catches a real write/publish inconsistency under load, not just at rest")
+		rps             = flag.Float64("rps", 25, "total requests/sec across every issuer, combined — a deliberately conservative default: a real shard's Redis is billed per command (docs/design.md §18), and every op here costs several Redis commands downstream, not one. Raise this deliberately, never by removing the cap.")
+		verify          = flag.Bool("verify", false, "after the run, check pool balance and decoy-noise safety directly against postgres/redis")
+		postgresDSN     = flag.String("postgres-dsn", "postgres://postgres:postgres@localhost:5432/statuslist?sslmode=disable", "used only with -verify")
+		shardRedisURLs  = flag.String("shard-redis-urls", `{"default":"redis://localhost:6379"}`, "used only with -verify; JSON object of shard_id -> that shard's own Redis URL, the same shape cmd/verifier-service's own SHARD_REDIS_URLS takes — must cover every shard an issuer could have been assigned to, or verify fails loudly rather than silently skipping that shard's allocations")
 	)
 	flag.Parse()
 
@@ -53,7 +54,7 @@ func main() {
 		ingressURL:     *ingressURL,
 		numIssuers:     *numIssuers,
 		duration:       *duration,
-		weights:        opWeights{allocate: *allocWeight, status: *statWeight, accounting: *acctWeight},
+		weights:        opWeights{allocate: *allocWeight, status: *statWeight, accounting: *acctWeight, lifecycle: *lifecycleWeight},
 		rps:            *rps,
 		verify:         *verify,
 		postgresDSN:    *postgresDSN,
@@ -95,8 +96,8 @@ func run(cfg runConfig) error {
 		prepared[i] = issuerAndToken{identity: ii, token: token}
 	}
 
-	fmt.Printf("generating load against %s for %s (mix: allocate=%.0f status=%.0f accounting=%.0f, capped at %.0f req/s total) ...\n",
-		cfg.ingressURL, cfg.duration, cfg.weights.allocate, cfg.weights.status, cfg.weights.accounting, cfg.rps)
+	fmt.Printf("generating load against %s for %s (mix: allocate=%.0f status=%.0f accounting=%.0f lifecycle=%.0f, capped at %.0f req/s total) ...\n",
+		cfg.ingressURL, cfg.duration, cfg.weights.allocate, cfg.weights.status, cfg.weights.accounting, cfg.weights.lifecycle, cfg.rps)
 
 	// One limiter shared by every worker (not one per worker at rps/N):
 	// the cap is meant to bound this run's total real-world cost, which
