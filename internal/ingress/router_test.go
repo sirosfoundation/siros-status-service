@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -98,6 +99,47 @@ func TestRouter_RoutesByShardClaim(t *testing.T) {
 		if got := resp.Header.Get("X-Backend"); got != tc.wantBackend {
 			t.Errorf("shard %s routed to backend %q, want %q", tc.shard, got, tc.wantBackend)
 		}
+	}
+}
+
+// TestRouter_ForwardsWithBackendHost guards against a real bug found
+// against the live multi-region deployment: NewSingleHostReverseProxy
+// leaves the outbound Host header as the router's own inbound Host,
+// which a plain httptest backend never notices (it dispatches on
+// connection, not Host) but which Fly's edge rejects with 421 when a
+// shard backend is itself a separate Fly app reachable only by its own
+// public hostname (see router.go's New for the full explanation).
+func TestRouter_ForwardsWithBackendHost(t *testing.T) {
+	km, validator := testValidator(t)
+
+	var gotHost string
+	shardA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost = r.Host
+		w.WriteHeader(200)
+	}))
+	defer shardA.Close()
+	shardAURL, err := url.Parse(shardA.URL)
+	if err != nil {
+		t.Fatalf("parse shard URL: %v", err)
+	}
+
+	router, err := New(validator, map[string]string{"shard-a": shardA.URL})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	proxySrv := httptest.NewServer(router)
+	defer proxySrv.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, proxySrv.URL+"/allocate", nil)
+	req.Header.Set("Authorization", "Bearer "+issueToken(t, km, "shard-a"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	if gotHost != shardAURL.Host {
+		t.Errorf("backend saw Host %q, want %q (the shard's own host, not the router's)", gotHost, shardAURL.Host)
 	}
 }
 

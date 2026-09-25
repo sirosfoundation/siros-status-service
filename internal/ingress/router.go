@@ -37,7 +37,27 @@ func New(validator *tokenauthvalidator.Validator, backends map[string]string) (*
 		if err != nil {
 			return nil, err
 		}
-		proxies[shardID] = httputil.NewSingleHostReverseProxy(target)
+		// Built via Rewrite (not NewSingleHostReverseProxy's Director,
+		// which leaves the outbound Host header as the inbound request's
+		// original Host) — harmless against a plain backend, but each
+		// shard backend here is itself a separate Fly app reachable only
+		// over its own public *.fly.dev hostname (docs/design.md §18: no
+		// private networking between these apps). Fly's edge picks the
+		// destination app from the TLS SNI (correctly, the shard's
+		// hostname, from target.Host) but then finds the HTTP Host header
+		// names a DIFFERENT app — an authority mismatch it rejects with
+		// 421 Misdirected Request (RFC 7540 §9.1.2), before the request
+		// ever reaches the shard's own handler. Found live against the
+		// real multi-region deployment (unit tests use httptest backends,
+		// which don't enforce SNI/Host agreement, so this never surfaced
+		// there). Setting pr.Out.Host = target.Host keeps SNI and Host in
+		// agreement.
+		proxies[shardID] = &httputil.ReverseProxy{
+			Rewrite: func(pr *httputil.ProxyRequest) {
+				pr.SetURL(target)
+				pr.Out.Host = target.Host
+			},
+		}
 	}
 	return &Router{validator: validator, proxies: proxies}, nil
 }
