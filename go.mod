@@ -9,6 +9,7 @@ require (
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/sirosfoundation/go-tokenauth v0.4.0
+	golang.org/x/time v0.16.0
 )
 
 require (

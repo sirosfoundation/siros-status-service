@@ -16,50 +16,62 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 func main() {
 	var (
-		asURL       = flag.String("as-url", "http://localhost:8090", "cmd/as base URL")
-		ingressURL  = flag.String("ingress-url", "http://localhost:8094", "cmd/ingress-router base URL — every timed request goes here")
-		numIssuers  = flag.Int("issuers", 50, "number of synthetic issuer identities, each its own goroutine")
-		duration    = flag.Duration("duration", 30*time.Second, "how long to generate load after setup completes")
-		allocWeight = flag.Float64("allocate-weight", 80, "relative weight of POST /allocate in the traffic mix")
-		statWeight  = flag.Float64("status-weight", 15, "relative weight of PATCH /status in the traffic mix")
-		acctWeight  = flag.Float64("accounting-weight", 5, "relative weight of GET /accounting/me in the traffic mix")
-		verify      = flag.Bool("verify", false, "after the run, check pool balance and decoy-noise safety directly against postgres/redis")
-		postgresDSN = flag.String("postgres-dsn", "postgres://postgres:postgres@localhost:5432/statuslist?sslmode=disable", "used only with -verify")
-		redisAddr   = flag.String("redis-addr", "localhost:6379", "used only with -verify; the target shard's own Redis")
+		asURL          = flag.String("as-url", "http://localhost:8090", "cmd/as base URL")
+		ingressURL     = flag.String("ingress-url", "http://localhost:8094", "cmd/ingress-router base URL — every timed request goes here")
+		numIssuers     = flag.Int("issuers", 50, "number of synthetic issuer identities, each its own goroutine")
+		duration       = flag.Duration("duration", 30*time.Second, "how long to generate load after setup completes")
+		allocWeight    = flag.Float64("allocate-weight", 80, "relative weight of POST /allocate in the traffic mix")
+		statWeight     = flag.Float64("status-weight", 15, "relative weight of PATCH /status in the traffic mix")
+		acctWeight     = flag.Float64("accounting-weight", 5, "relative weight of GET /accounting/me in the traffic mix")
+		rps            = flag.Float64("rps", 25, "total requests/sec across every issuer, combined — a deliberately conservative default: a real shard's Redis is billed per command (docs/design.md §18), and every op here costs several Redis commands downstream, not one. Raise this deliberately, never by removing the cap.")
+		verify         = flag.Bool("verify", false, "after the run, check pool balance and decoy-noise safety directly against postgres/redis")
+		postgresDSN    = flag.String("postgres-dsn", "postgres://postgres:postgres@localhost:5432/statuslist?sslmode=disable", "used only with -verify")
+		shardRedisURLs = flag.String("shard-redis-urls", `{"default":"redis://localhost:6379"}`, "used only with -verify; JSON object of shard_id -> that shard's own Redis URL, the same shape cmd/verifier-service's own SHARD_REDIS_URLS takes — must cover every shard an issuer could have been assigned to, or verify fails loudly rather than silently skipping that shard's allocations")
 	)
 	flag.Parse()
 
+	var shardRedis map[string]string
+	if err := json.Unmarshal([]byte(*shardRedisURLs), &shardRedis); err != nil {
+		log.Fatalf("-shard-redis-urls: %v", err)
+	}
+
 	if err := run(runConfig{
-		asURL:       *asURL,
-		ingressURL:  *ingressURL,
-		numIssuers:  *numIssuers,
-		duration:    *duration,
-		weights:     opWeights{allocate: *allocWeight, status: *statWeight, accounting: *acctWeight},
-		verify:      *verify,
-		postgresDSN: *postgresDSN,
-		redisAddr:   *redisAddr,
+		asURL:          *asURL,
+		ingressURL:     *ingressURL,
+		numIssuers:     *numIssuers,
+		duration:       *duration,
+		weights:        opWeights{allocate: *allocWeight, status: *statWeight, accounting: *acctWeight},
+		rps:            *rps,
+		verify:         *verify,
+		postgresDSN:    *postgresDSN,
+		shardRedisURLs: shardRedis,
 	}); err != nil {
 		log.Fatal(err)
 	}
 }
 
 type runConfig struct {
-	asURL, ingressURL      string
-	numIssuers             int
-	duration               time.Duration
-	weights                opWeights
-	verify                 bool
-	postgresDSN, redisAddr string
+	asURL, ingressURL string
+	numIssuers        int
+	duration          time.Duration
+	weights           opWeights
+	rps               float64
+	verify            bool
+	postgresDSN       string
+	shardRedisURLs    map[string]string
 }
 
 func run(cfg runConfig) error {
@@ -83,8 +95,13 @@ func run(cfg runConfig) error {
 		prepared[i] = issuerAndToken{identity: ii, token: token}
 	}
 
-	fmt.Printf("generating load against %s for %s (mix: allocate=%.0f status=%.0f accounting=%.0f) ...\n",
-		cfg.ingressURL, cfg.duration, cfg.weights.allocate, cfg.weights.status, cfg.weights.accounting)
+	fmt.Printf("generating load against %s for %s (mix: allocate=%.0f status=%.0f accounting=%.0f, capped at %.0f req/s total) ...\n",
+		cfg.ingressURL, cfg.duration, cfg.weights.allocate, cfg.weights.status, cfg.weights.accounting, cfg.rps)
+
+	// One limiter shared by every worker (not one per worker at rps/N):
+	// the cap is meant to bound this run's total real-world cost, which
+	// doesn't change with how many issuer goroutines happen to produce it.
+	limiter := rate.NewLimiter(rate.Limit(cfg.rps), max(1, int(cfg.rps)))
 
 	results := make([]*workerResult, cfg.numIssuers)
 	deadline := time.Now().Add(cfg.duration)
@@ -97,7 +114,7 @@ func run(cfg runConfig) error {
 		wg.Add(1)
 		go func(token string, result *workerResult) {
 			defer wg.Done()
-			runWorker(client, cfg.ingressURL, token, cfg.weights, deadline, result)
+			runWorker(client, cfg.ingressURL, token, cfg.weights, limiter, deadline, result)
 		}(prepared[i].token, result)
 	}
 	wg.Wait()
@@ -110,7 +127,7 @@ func run(cfg runConfig) error {
 		fmt.Println("\nverifying against postgres/redis directly ...")
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := verifyDecoySafety(ctx, cfg.postgresDSN, cfg.redisAddr, results); err != nil {
+		if err := verifyDecoySafety(ctx, cfg.postgresDSN, cfg.shardRedisURLs, results); err != nil {
 			return err
 		}
 	}

@@ -55,24 +55,39 @@ func printPoolBalance(results []*workerResult) {
 }
 
 // verifyDecoySafety re-reads every index this run allocated or patched
-// directly from the shard's own stores and compares it against what
-// this harness itself last wrote (allocRecord.expected). A mismatch
-// means something — most plausibly internal/decoy, given this is
-// exactly the invariant docs/design.md §17 depends on — silently
+// directly from its owning shard's own stores and compares it against
+// what this harness itself last wrote (allocRecord.expected). A
+// mismatch means something — most plausibly internal/decoy, given this
+// is exactly the invariant docs/design.md §17 depends on — silently
 // overwrote a real credential's real status. Any single mismatch is
 // reported individually: this is a correctness check, not a sampled
 // metric, so it never summarizes past the first N failures the way a
 // latency report would.
-func verifyDecoySafety(ctx context.Context, postgresDSN, redisAddr string, results []*workerResult) error {
+//
+// shardRedisURLs maps shard_id -> that shard's own Redis URL, the same
+// shape cmd/verifier-service's own SHARD_REDIS_URLS takes (docs/
+// design.md §18): a run's issuers can land on any configured shard
+// (internal/as's AssignOrLookup), so checking only one shard's Redis
+// would silently skip every allocation that happened to land elsewhere
+// — this fails loudly instead, the first time it hits a list whose
+// shard isn't in the map.
+func verifyDecoySafety(ctx context.Context, postgresDSN string, shardRedisURLs map[string]string, results []*workerResult) error {
 	meta, err := store.NewMetaStore(ctx, postgresDSN)
 	if err != nil {
 		return fmt.Errorf("verify: connect postgres: %w", err)
 	}
 	defer meta.Close()
 
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
-	defer func() { _ = rdb.Close() }()
-	bitmaps := store.NewBitmapStore(rdb)
+	bitmapsByShard := make(map[string]*store.BitmapStore, len(shardRedisURLs))
+	for shardID, url := range shardRedisURLs {
+		opts, err := redis.ParseURL(url)
+		if err != nil {
+			return fmt.Errorf("verify: parse redis url for shard %s: %w", shardID, err)
+		}
+		rdb := redis.NewClient(opts)
+		defer func() { _ = rdb.Close() }()
+		bitmapsByShard[shardID] = store.NewBitmapStore(rdb)
+	}
 
 	listMetaCache := map[string]*store.ListMeta{}
 	snapshotCache := map[string][]byte{}
@@ -88,6 +103,11 @@ func verifyDecoySafety(ctx context.Context, postgresDSN, redisAddr string, resul
 					return fmt.Errorf("verify: could not load list %s: %w", rec.listID, err)
 				}
 				listMetaCache[rec.listID] = lm
+			}
+
+			bitmaps, ok := bitmapsByShard[lm.ShardID]
+			if !ok {
+				return fmt.Errorf("verify: list %s belongs to shard %q, not covered by -shard-redis-urls (have: %v)", rec.listID, lm.ShardID, shardRedisKeys(shardRedisURLs))
 			}
 
 			raw, ok := snapshotCache[rec.listID]
@@ -122,6 +142,15 @@ func verifyDecoySafety(ctx context.Context, postgresDSN, redisAddr string, resul
 		return fmt.Errorf("verify: %d indices had a status this harness never wrote — see docs/design.md §17", mismatches)
 	}
 	return nil
+}
+
+func shardRedisKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func statusName(s statuslist.Status) string {

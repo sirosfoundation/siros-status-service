@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 // opWeights controls the traffic mix one issuer generates — POST
@@ -69,8 +72,19 @@ func newWorkerResult(issuerID string) *workerResult {
 // deadline, using token for every call — cmd/ingress-router verifies it
 // offline against the AS's JWKS and routes on its tenant_id claim
 // (docs/design.md §15.6), so from here it's an ordinary bearer token.
-func runWorker(client *http.Client, ingressURL, token string, weights opWeights, deadline time.Time, result *workerResult) {
-	for time.Now().Before(deadline) {
+// limiter is shared across every worker in this run (main.go's run):
+// waiting on it here, rather than each worker having its own share of
+// the budget, means the cap holds however many issuer goroutines happen
+// to be producing the traffic.
+func runWorker(client *http.Client, ingressURL, token string, weights opWeights, limiter *rate.Limiter, deadline time.Time, result *workerResult) {
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	for {
+		if err := limiter.Wait(ctx); err != nil {
+			// Deadline reached while waiting for rate budget — an
+			// ordinary end of run, not a failure.
+			return
+		}
 		op := weights.pick()
 		start := time.Now()
 		err := doOp(client, ingressURL, token, op, result)
