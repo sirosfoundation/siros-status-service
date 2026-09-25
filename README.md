@@ -215,9 +215,9 @@ Common to every binary: `HTTP_ADDR`, `BASE_URL`, `DATABASE_URL`.
 
 ## Deploying to Fly
 
-Five Fly apps (docs/design.md §18), each with its own `fly.*.toml` — this
-org's convention for a standalone service is its own fly config rather
-than being orchestrated through `sirosid-dev` (see
+Six Fly apps (docs/design.md §18/§21), each with its own `fly.*.toml` —
+this org's convention for a standalone service is its own fly config
+rather than being orchestrated through `sirosid-dev` (see
 [go-zk-circuits](https://github.com/sirosfoundation/go-zk-circuits)'s
 `fly.toml` for another example of the same pattern):
 
@@ -228,6 +228,7 @@ than being orchestrated through `sirosid-dev` (see
 | `siros-status-service-ingestion-fra` | `fly.ingestion.fra.toml` | `fra` | internal only |
 | `siros-status-service-verifier` | `fly.verifier.toml` | `iad` | **`lists.t.status.siros.org`** |
 | `siros-status-service-ingress` | `fly.ingress.toml` | `iad` + `fra` | **`api.t.status.siros.org`** |
+| `siros-status-service-metrics` | `fly.metrics.toml` | `iad` | no — see "Observability" below |
 
 **One shard per region** (`iad`, `fra` to start): each `-ingestion-<region>`
 app is a real, separate shard with its own Redis — that's genuine
@@ -256,10 +257,19 @@ fly apps create siros-status-service-ingress
 
 fly postgres create --name siros-status-service-db --region iad
 fly postgres attach siros-status-service-db -a siros-status-service-as
-fly postgres attach siros-status-service-db -a siros-status-service-ingestion-iad
-fly postgres attach siros-status-service-db -a siros-status-service-ingestion-fra
-fly postgres attach siros-status-service-db -a siros-status-service-verifier
-# `attach` sets each app's DATABASE_URL secret directly — no manual copy needed.
+# `attach` sets DATABASE_URL directly, and defaults to a separate
+# database per consuming app — fine for -as (its issuer_shard table is
+# never read by anyone else), but -ingestion-iad, -ingestion-fra, and
+# -verifier all read/write the SAME `lists` table (a verifier must see
+# lists either shard's ingestion-service created), so they need
+# --database-name pointed at the SAME database explicitly, with distinct
+# --database-user values (attach errors if a name/user pair repeats):
+fly postgres attach siros-status-service-db -a siros-status-service-ingestion-iad \
+  --database-name siros_status_service_shared --database-user siros_status_service_ingestion_iad
+fly postgres attach siros-status-service-db -a siros-status-service-ingestion-fra \
+  --database-name siros_status_service_shared --database-user siros_status_service_ingestion_fra
+fly postgres attach siros-status-service-db -a siros-status-service-verifier \
+  --database-name siros_status_service_shared --database-user siros_status_service_verifier
 
 fly redis create --name siros-status-service-redis-iad --region iad --no-replicas
 fly redis create --name siros-status-service-redis-fra --region fra --no-replicas
@@ -303,10 +313,45 @@ fly certs add lists.t.status.siros.org -a siros-status-service-verifier
 `TRUST_PDP_URL` is deliberately left unset in `fly.as.toml` — see "Known
 gaps" below before pointing this at a real deployment.
 
+## Observability
+
+Every service exposes `GET /metrics` (Prometheus text format,
+`internal/metrics` — docs/design.md §21). Check it directly against any
+already-deployed app:
+
+```sh
+curl https://auth.t.status.siros.org/metrics
+```
+
+For cross-cluster capacity planning in Grafana Cloud, a sixth Fly app
+(`siros-status-service-metrics`, `fly.metrics.toml`) runs Grafana Alloy
+to privately scrape every app's `/metrics` over Fly's internal
+networking and remote_write to Grafana Cloud:
+
+```sh
+fly apps create siros-status-service-metrics
+fly secrets set -a siros-status-service-metrics \
+  GRAFANA_CLOUD_PROMETHEUS_URL="https://<your-stack>.grafana.net/api/prom/push" \
+  GRAFANA_CLOUD_PROMETHEUS_USERNAME="<your instance ID>" \
+  GRAFANA_CLOUD_PROMETHEUS_API_KEY="<your API key>"
+# all three from your Grafana Cloud stack's "Connections > Prometheus" page
+fly deploy -c fly.metrics.toml
+```
+
+`CLUSTER_LABEL` in `fly.metrics.toml` (default `"test"`) is this
+deployment's identity in Grafana Cloud — the one place that label is
+set; no metric emitted by the four Go binaries themselves carries a
+cluster or service label (see §21 for why). Give each future deployment
+its own `fly.metrics.toml` with its own `CLUSTER_LABEL` to compare them
+in the same Grafana Cloud dashboards.
+
 ## Known gaps vs. the full design
 
 These are intentionally deferred, not oversights:
 
+- **`/metrics` is unauthenticated on the same public hostname as
+  everything else**: acceptable for a test deployment, not something to
+  carry into a production posture unreviewed (docs/design.md §21).
 - **GC row cleanup**: `internal/gc` drops a list's Redis bitmap once past
   retention, but its Postgres row (metadata + ownership records) is kept
   indefinitely — needed for `410` semantics and audit history. Revisit

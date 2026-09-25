@@ -1,0 +1,52 @@
+# Standalone Fly app config for the Grafana Alloy metrics shipper
+# (docs/design.md §21) — unlike every other fly.*.toml in this repo,
+# this one is NOT one of the four Go binaries: it builds Grafana Alloy's
+# own public image (alloy/Dockerfile), configured (alloy/config.alloy)
+# to privately scrape every other app's /metrics over Fly's private
+# networking (.flycast — never the public hostnames; scraping is a
+# separate concern from the ingress-router/shard-backend routing
+# decisions elsewhere in this repo, which use public hostnames for
+# unrelated reasons) and remote_write to Grafana Cloud.
+#
+# No [http_service]/public exposure: this app answers no requests of
+# its own, only makes outbound scrape+remote_write calls, so there is
+# nothing for a custom domain or public port to serve. A single
+# always-on machine (min_machines_running = 1, no auto_stop) — unlike
+# every other app here, scaling this to zero would silently stop metrics
+# collection rather than just adding request latency.
+#
+# Required secrets before first deploy (from your Grafana Cloud stack's
+# "Connections > Prometheus" page — Details tab has the remote_write URL
+# and instance/username; "Generate now" under the API key section
+# creates GRAFANA_CLOUD_PROMETHEUS_API_KEY):
+#   fly secrets set -a siros-status-service-metrics \
+#     GRAFANA_CLOUD_PROMETHEUS_URL="https://<your-stack>.grafana.net/api/prom/push" \
+#     GRAFANA_CLOUD_PROMETHEUS_USERNAME="<your instance ID>" \
+#     GRAFANA_CLOUD_PROMETHEUS_API_KEY="<your API key>"
+
+app = "siros-status-service-metrics"
+primary_region = "iad"
+
+[build]
+  dockerfile = "alloy/Dockerfile"
+  context = "alloy"
+
+[env]
+  # This deployment's identity for cross-cluster capacity-planning
+  # dashboards in Grafana Cloud (docs/design.md §21) — change per
+  # deployment, never inside the application binaries themselves.
+  CLUSTER_LABEL = "test"
+
+[processes]
+  app = "/bin/alloy run /etc/alloy/config.alloy --storage.path=/var/lib/alloy/data --server.http.listen-addr=0.0.0.0:12345"
+
+[[checks]]
+  type = "tcp"
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "15s"
+  port = 12345
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

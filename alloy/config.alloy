@@ -1,0 +1,38 @@
+// Grafana Alloy config for the metrics-shipping app (docs/design.md §21):
+// privately scrapes every siros-status-service Fly app's /metrics over
+// Fly's private networking (their .flycast addresses, never the public
+// hostnames) and remote_writes to Grafana Cloud.
+//
+// CLUSTER_LABEL is this deployment's identity for cross-cluster capacity
+// planning in Grafana Cloud — deliberately the only place that label is
+// set (never inside the application binaries themselves; see §21).
+// GRAFANA_CLOUD_PROMETHEUS_URL/_USERNAME/_API_KEY come from this app's
+// Fly secrets (fly secrets set -a siros-status-service-metrics ...) —
+// never hardcoded here.
+
+prometheus.scrape "status_service" {
+	targets = [
+		{"__address__" = "siros-status-service-as.flycast:8080", "job" = "as"},
+		{"__address__" = "siros-status-service-ingestion-iad.flycast:8080", "job" = "ingestion-iad"},
+		{"__address__" = "siros-status-service-ingestion-fra.flycast:8080", "job" = "ingestion-fra"},
+		{"__address__" = "siros-status-service-verifier.flycast:8080", "job" = "verifier"},
+		{"__address__" = "siros-status-service-ingress.flycast:8080", "job" = "ingress"},
+	]
+	scrape_interval = "30s"
+	forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+prometheus.remote_write "grafana_cloud" {
+	endpoint {
+		url = env("GRAFANA_CLOUD_PROMETHEUS_URL")
+
+		basic_auth {
+			username = env("GRAFANA_CLOUD_PROMETHEUS_USERNAME")
+			password = env("GRAFANA_CLOUD_PROMETHEUS_API_KEY")
+		}
+	}
+
+	external_labels = {
+		cluster = env("CLUSTER_LABEL"),
+	}
+}
