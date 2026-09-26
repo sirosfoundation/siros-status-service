@@ -21,13 +21,22 @@ import (
 
 // IngestionConfig configures cmd/ingestion-service.
 type IngestionConfig struct {
+	// HTTPAddr is the address this service listens on (host:port, or
+	// just :port).
 	HTTPAddr string
 	// BaseURL is this service's own public base URL, used to build
 	// {list_url} values returned from POST /allocate.
 	BaseURL string
 
-	RedisAddr   string
-	RedisURL    string
+	// RedisAddr is used only if RedisURL is unset. RedisURL (a full
+	// redis:// or rediss:// URL) takes priority when set, and is
+	// required for managed offerings needing auth/TLS (e.g. Fly's
+	// Upstash-backed Redis).
+	RedisAddr string
+	RedisURL  string
+	// PostgresDSN is the shared metadata Postgres connection string —
+	// the same database as cmd/as and cmd/verifier-service point at
+	// (docs/design.md §18).
 	PostgresDSN string
 
 	// ShardID is which shard (docs/design.md §15.5) this instance owns —
@@ -72,12 +81,17 @@ type IngestionConfig struct {
 	// default (e.g. the test deployment uses 24h).
 	MaxExpiry time.Duration
 
+	// GCGracePeriod, GCRetentionPeriod, and GCCheckInterval configure
+	// internal/gc's archive/purge sweep (§7 point 4) — see
+	// VerifierConfig.GCRetentionPeriod's own comment for why the
+	// verifier needs a copy of just that one value.
 	GCGracePeriod     time.Duration
 	GCRetentionPeriod time.Duration
 	GCCheckInterval   time.Duration
 
 	// SigningKey signs StatusListTokens; SigningKeyID is placed in the
-	// JWS `kid` header.
+	// JWS `kid` header — must match across every ingestion shard and the
+	// verifier (one signing identity).
 	SigningKey   *ecdsa.PrivateKey
 	SigningKeyID string
 
@@ -87,6 +101,7 @@ type IngestionConfig struct {
 	ASJWKSURL           string
 	AccessTokenIssuer   string
 	AccessTokenAudience string
+	// JWKSRefreshInterval is how often ASJWKSURL is re-fetched.
 	JWKSRefreshInterval time.Duration
 }
 
@@ -174,8 +189,17 @@ func LoadIngestion() (*IngestionConfig, error) {
 
 // VerifierConfig configures cmd/verifier-service.
 type VerifierConfig struct {
-	HTTPAddr    string
-	BaseURL     string
+	// HTTPAddr is the address this service listens on (host:port, or
+	// just :port).
+	HTTPAddr string
+	// BaseURL is this service's own public base URL — signed into every
+	// published StatusListToken's `sub` claim, and what every ingestion
+	// shard's own BaseURL points POST /allocate's `list_url` response at
+	// (docs/design.md §18).
+	BaseURL string
+	// PostgresDSN is the shared metadata Postgres connection string —
+	// the same database as cmd/as and every cmd/ingestion-service shard
+	// point at (docs/design.md §18).
 	PostgresDSN string
 
 	// ShardRedisURLs maps shard_id -> that shard's Redis connection
@@ -183,6 +207,8 @@ type VerifierConfig struct {
 	// depending on which shard a requested list belongs to (§15.5).
 	ShardRedisURLs map[string]string
 
+	// DefaultTTLSeconds is the fallback cache lifetime applied when an
+	// issuer didn't set its own at allocation time (§9/§13).
 	DefaultTTLSeconds int64
 	// GCRetentionPeriod must match the ingestion shards' own setting —
 	// it's how the verifier decides whether an ARCHIVED list is still
@@ -191,7 +217,11 @@ type VerifierConfig struct {
 	// ingestion side (internal/gc); the verifier only reads this value.
 	GCRetentionPeriod time.Duration
 
-	SigningKey   *ecdsa.PrivateKey
+	// SigningKey signs StatusListTokens.
+	SigningKey *ecdsa.PrivateKey
+	// SigningKeyID is placed in the JWS `kid` header on published
+	// StatusListTokens — must match every ingestion shard's own value
+	// (one signing identity).
 	SigningKeyID string
 }
 
@@ -227,20 +257,29 @@ func LoadVerifier() (*VerifierConfig, error) {
 
 // ASConfig configures cmd/as, the Authorization Server (§15.2).
 type ASConfig struct {
+	// HTTPAddr is the address this service listens on (host:port, or
+	// just :port).
 	HTTPAddr string
 	// BaseURL is the AS's own public base URL — both the `iss` claim on
 	// minted tokens and the expected `aud` on inbound client assertions.
 	BaseURL string
 
+	// PostgresDSN is the shared metadata Postgres connection string —
+	// the same database as every cmd/ingestion-service shard and
+	// cmd/verifier-service point at (docs/design.md §18).
 	PostgresDSN string
 
 	// SigningKey signs access tokens; deliberately distinct from the
 	// StatusListToken signing key (different service, different trust
-	// boundary — see docs/design.md §15.8).
+	// boundary — see docs/design.md §15.8). SigningKeyID is placed in
+	// the JWS `kid` header on minted access tokens.
 	SigningKey   *ecdsa.PrivateKey
 	SigningKeyID string
 
-	AccessTokenTTL      time.Duration
+	AccessTokenTTL time.Duration
+	// AccessTokenAudience is the `aud` claim minted access tokens carry,
+	// and what every consumer (cmd/ingress-router, cmd/ingestion-service)
+	// requires an inbound token to match.
 	AccessTokenAudience string
 
 	// Shards is the pool of shard IDs new issuers get round-robin
@@ -252,7 +291,9 @@ type ASConfig struct {
 	// error/unreachability fails closed (no token issued). If unset, the
 	// default is AllowAllEvaluator — fail *open* — so a prototype/dev
 	// deployment works without a PDP; never appropriate for production.
-	TrustPDPURL     string
+	TrustPDPURL string
+	// TrustActionName is the AuthZEN action name sent to the PDP — only
+	// meaningful when TrustPDPURL is set.
 	TrustActionName string
 }
 
@@ -282,11 +323,17 @@ func LoadAS() (*ASConfig, error) {
 
 // IngressConfig configures cmd/ingress-router (§15.6).
 type IngressConfig struct {
+	// HTTPAddr is the address this service listens on (host:port, or
+	// just :port).
 	HTTPAddr string
 
+	// ASJWKSURL, AccessTokenIssuer, and AccessTokenAudience configure
+	// offline access-token verification (§15.3/§15.6) — the AS is never
+	// called on the request path, only its JWKS is fetched and cached.
 	ASJWKSURL           string
 	AccessTokenIssuer   string
 	AccessTokenAudience string
+	// JWKSRefreshInterval is how often ASJWKSURL is re-fetched.
 	JWKSRefreshInterval time.Duration
 
 	// ShardBackends maps shard_id -> that shard's ingestion-service base

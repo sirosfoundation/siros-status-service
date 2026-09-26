@@ -1,0 +1,385 @@
+openapi: 3.0.3
+info:
+  title: SIROS Status List Service
+  version: "0.1"
+  description: >-
+    Implements IETF draft-ietf-oauth-status-list-21. Issuers allocate an
+    index and set its status; verifiers fetch the resulting signed status
+    list. Regenerate/validate coverage of this spec against the real
+    registered routes with `go test ./docs/...`
+    (docs/openapi_coverage_test.go) — this file is hand-authored, not
+    generated from code annotations, but that test fails CI if it drifts
+    from what the four binaries actually register.
+  license:
+    name: See repository LICENSE
+externalDocs:
+  description: IETF draft-ietf-oauth-status-list-21
+  url: https://datatracker.ietf.org/doc/draft-ietf-oauth-status-list/
+
+# Three logical servers, one per public-facing role (docs/design.md
+# §15.1/§18) — cmd/ingestion-service itself has no public hostname of its
+# own in a real deployment; its routes below are reached through the
+# issuer-api server (cmd/ingress-router), which proxies by the access
+# token's shard claim (§15.6). The test deployment's concrete values are
+# on status.siros.org's environment pages, not hardcoded here.
+servers:
+  - url: "{scheme}://{host}"
+    description: Authorization Server (token issuance)
+    variables:
+      scheme: { default: "https" }
+      host: { default: "auth.example.org" }
+  - url: "{scheme}://{host}"
+    description: Issuer API (allocate, status, accounting)
+    variables:
+      scheme: { default: "https" }
+      host: { default: "api.example.org" }
+  - url: "{scheme}://{host}"
+    description: Verifier (published status lists)
+    variables:
+      scheme: { default: "https" }
+      host: { default: "lists.example.org" }
+
+paths:
+  /healthz:
+    get:
+      operationId: healthz
+      summary: Liveness check
+      description: >-
+        Identical shape on every one of the four binaries (cmd/as,
+        cmd/ingestion-service, cmd/verifier-service, cmd/ingress-router) —
+        listed once here rather than once per server.
+      tags: [Operational]
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /metrics:
+    get:
+      operationId: metrics
+      summary: Prometheus metrics
+      description: >-
+        Identical shape on every one of the four binaries (docs/design.md
+        §21). Text-format Prometheus exposition, not JSON.
+      tags: [Operational]
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /token:
+    post:
+      operationId: issueToken
+      summary: Exchange a client assertion for an access token
+      description: >-
+        OAuth 2.0 client-credentials grant with a JWT-bearer client
+        assertion (RFC 7523 §2.2) — no separate registered client secret,
+        no pre-registration step. The assertion itself, self-signed, is
+        the whole proof of possession.
+      tags: [Authorization Server]
+      security: []
+      servers:
+        - url: "{scheme}://{host}"
+          description: Authorization Server
+          variables:
+            scheme: { default: "https" }
+            host: { default: "auth.example.org" }
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [grant_type, client_assertion_type, client_assertion]
+              properties:
+                grant_type:
+                  type: string
+                  enum: [client_credentials]
+                client_assertion_type:
+                  type: string
+                  enum:
+                    - "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+                client_assertion:
+                  type: string
+                  description: >-
+                    A JWT (ES256 only) with either a `jwk` header (RFC
+                    7515 §4.1.3, bare public key) or an `x5c` header (RFC
+                    7515 §4.1.6, certificate chain, leaf first) —
+                    exactly one, never both. Claims: `iss`/`sub` (your
+                    chosen issuer identifier, identical values), `aud`
+                    (this operation's own URL, exact match), `iat`/`exp`
+                    (now, and no more than 5 minutes later).
+      responses:
+        "200":
+          description: Access token issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access_token: { type: string }
+                  token_type: { type: string, enum: [Bearer] }
+                  expires_in: { type: integer, description: seconds until access_token expires }
+        "400":
+          description: Malformed request (wrong grant_type, missing client_assertion, ...)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: >-
+            The client assertion did not verify — expired, wrong `aud`,
+            malformed, or (once a real trust source is configured) an
+            untrusted key/chain. Deliberately the same shape for all of
+            these; see status.siros.org's Get Started guide.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /.well-known/jwks.json:
+    get:
+      operationId: getASJWKS
+      summary: Authorization Server's public signing key
+      description: >-
+        What cmd/ingress-router and cmd/ingestion-service fetch (and
+        cache) to verify access tokens offline (docs/design.md §15.3) —
+        not something a typical issuer/verifier integration calls
+        directly.
+      tags: [Authorization Server]
+      security: []
+      servers:
+        - url: "{scheme}://{host}"
+          description: Authorization Server
+          variables:
+            scheme: { default: "https" }
+            host: { default: "auth.example.org" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys:
+                    type: array
+                    items:
+                      type: object
+                      description: RFC 7517 JSON Web Key
+
+  /allocate:
+    post:
+      operationId: allocate
+      summary: Allocate a new credential's index
+      description: >-
+        Creates a new, opaque status-list index for one credential. The
+        caller's issuer identity comes from their access token, not a
+        request field.
+      tags: [Issuer API]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                exp:
+                  type: string
+                  format: date-time
+                  description: >-
+                    The credential's own expiration. Omit entirely (no
+                    body, or a body without this field) to get this
+                    deployment's configured maximum (docs/design.md §19)
+                    — not an arbitrary short default.
+      responses:
+        "201":
+          description: Allocated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  list_url:
+                    type: string
+                    description: Fetch this from the verifier server to read the credential's status.
+                  index: { type: integer, format: int64 }
+                  exp:
+                    type: string
+                    format: date-time
+                    description: The expiration actually recorded (echoes the request, or the deployment maximum if omitted).
+        "400":
+          description: "`exp` is further out than this deployment's configured maximum"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: Missing, malformed, or invalid/expired bearer token
+          headers:
+            WWW-Authenticate:
+              schema: { type: string }
+              description: 'RFC 6750 §3 challenge, e.g. `Bearer error="invalid_token", error_description="the access token expired"`'
+        "503":
+          description: No active list available / pool exhausted after retrying; try again shortly
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /status/{listID}/{index}:
+    patch:
+      operationId: setStatus
+      summary: Set a credential's status
+      description: Revoke, suspend, or reinstate a credential this same issuer allocated.
+      tags: [Issuer API]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: listID
+          in: path
+          required: true
+          schema: { type: string }
+        - name: index
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [VALID, INVALID, SUSPENDED]
+                  description: "`INVALID` means revoked."
+      responses:
+        "204":
+          description: Status updated
+        "400":
+          description: Invalid index, malformed body, or unknown status value
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: Missing, malformed, or invalid/expired bearer token
+        "403":
+          description: This index was allocated by a different issuer — ownership is enforced server-side.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: No such list
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "410":
+          description: This list is archived (every credential in it has already expired) — no further updates are possible.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /accounting/me:
+    get:
+      operationId: accountingMe
+      summary: The caller's own allocation counts
+      description: Self-service usage lookup, scoped to the caller's own issuer identity from their access token.
+      tags: [Issuer API]
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  issuer_id: { type: string }
+                  usage:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        shard_id: { type: string }
+                        index_count: { type: integer, format: int64 }
+        "401":
+          description: Missing, malformed, or invalid/expired bearer token
+
+  /lists/{listID}:
+    get:
+      operationId: getList
+      summary: Fetch a published status list
+      description: >-
+        No authentication. Returns a signed Status List Token; decompress
+        and bit-unpack its `status_list` claim to read any index, not
+        just one you ask for by name. Standard HTTP caching applies —
+        poll as often as you like.
+      tags: [Verifier]
+      security: []
+      servers:
+        - url: "{scheme}://{host}"
+          description: Verifier
+          variables:
+            scheme: { default: "https" }
+            host: { default: "lists.example.org" }
+      parameters:
+        - name: listID
+          in: path
+          required: true
+          schema: { type: string }
+        - name: If-None-Match
+          in: header
+          required: false
+          schema: { type: string }
+          description: A previously-seen ETag — returns 304 with no body if the list hasn't changed.
+      responses:
+        "200":
+          description: OK
+          headers:
+            ETag: { schema: { type: string } }
+            Cache-Control: { schema: { type: string } }
+          content:
+            application/statuslist+jwt:
+              schema:
+                type: string
+                description: >-
+                  Signed Status List Token (JWT). Payload carries
+                  `sub` (this list's own URL), `iat`, `ttl`, and
+                  `status_list: {bits, lst}` per
+                  draft-ietf-oauth-status-list-21 §4.1/§5.1.
+        "304":
+          description: Not modified (If-None-Match matched)
+        "404":
+          description: No such list
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "410":
+          description: This list was archived and has passed its retention window.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: >-
+        Opaque to the caller; internally an offline-verifiable JWT naming
+        the issuer's assigned shard (docs/design.md §15.3).
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        error_description: { type: string }
+      required: [error]

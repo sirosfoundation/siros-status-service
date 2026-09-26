@@ -20,6 +20,14 @@ jobs:
         config: ./.testcoverage.yml
         git-token: ${{ github.ref_name == 'main' && secrets.GITHUB_TOKEN || '' }}
         git-branch: badges
+    - name: Check docs/CONFIGURATION.md is up to date
+      run: |
+        make gen-config-docs
+        if [ -n "$(git status --porcelain -- docs/CONFIGURATION.md)" ]; then
+          git diff -- docs/CONFIGURATION.md || true
+          echo "::error::docs/CONFIGURATION.md is out of date. Run 'make gen-config-docs' and commit the result."
+          exit 1
+        fi
 
   lint:
     runs-on: ubuntu-latest

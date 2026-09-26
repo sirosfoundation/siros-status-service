@@ -92,6 +92,10 @@ clean: ## Remove build artifacts
 gen-fixture: ## Regenerate rust/token-format's test fixture (a real token from internal/accesstoken.KeyManager)
 	go run ./tools/gen-fixture
 
+.PHONY: gen-config-docs
+gen-config-docs: ## Regenerate docs/CONFIGURATION.md from internal/config/config.go
+	go run ./tools/gen-config-docs
+
 .PHONY: rust-test
 rust-test: ## Run the rust/ workspace's tests (docs/design.md §16 — Fastly Compute investigation)
 	cd rust && cargo test --locked -p token-format
