@@ -46,7 +46,14 @@ CREATE TABLE IF NOT EXISTS lists (
 ALTER TABLE lists ADD COLUMN IF NOT EXISTS archived_at timestamptz;
 ALTER TABLE lists ADD COLUMN IF NOT EXISTS purged boolean NOT NULL DEFAULT false;
 ALTER TABLE lists ADD COLUMN IF NOT EXISTS shard_id text NOT NULL DEFAULT 'default';
+-- docs/design.md §22: when the Redis bitmap was purged, so a second,
+-- independently-configured retention window (DBRetentionPeriod) can
+-- decide when it's safe to hard-delete this row (and its allocations)
+-- entirely — distinct from GCRetentionPeriod, which only governs the
+-- Redis-bitmap purge above and the 410-vs-404 response window.
+ALTER TABLE lists ADD COLUMN IF NOT EXISTS purged_at timestamptz;
 CREATE INDEX IF NOT EXISTS lists_shard_state_idx ON lists (shard_id, state);
+CREATE INDEX IF NOT EXISTS lists_purged_at_idx ON lists (purged_at) WHERE purged_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS allocations (
 	list_id    text NOT NULL REFERENCES lists(id),
@@ -89,6 +96,11 @@ type ListMeta struct {
 	// design.md §7 point 4) — internal/decoy checks this before noising
 	// an ARCHIVED list, since there's no bitmap left to write to.
 	Purged bool
+	// PurgedAt is when Purged was set — nil until then. Starts the clock
+	// for DBRetentionPeriod (§22): the row itself (and its allocations)
+	// are only ever hard-deleted this long after the bitmap was purged,
+	// never before.
+	PurgedAt *time.Time
 }
 
 // Remaining returns how many unallocated slots this list has left.
@@ -146,12 +158,12 @@ func (m *MetaStore) CreateList(ctx context.Context, id string, bits int, size ui
 	return &ListMeta{ID: id, Bits: bits, Size: size, FPEKey: fpeKey, State: "ACTIVE", ShardID: shardID}, nil
 }
 
-const listColumns = `id, bits, size, cursor, fpe_key, max_exp, state, created_at, archived_at, shard_id, purged`
+const listColumns = `id, bits, size, cursor, fpe_key, max_exp, state, created_at, archived_at, shard_id, purged, purged_at`
 
 func scanListMeta(row pgx.Row) (*ListMeta, error) {
 	var lm ListMeta
 	var size, cursor int64
-	if err := row.Scan(&lm.ID, &lm.Bits, &size, &cursor, &lm.FPEKey, &lm.MaxExp, &lm.State, &lm.CreatedAt, &lm.ArchivedAt, &lm.ShardID, &lm.Purged); err != nil {
+	if err := row.Scan(&lm.ID, &lm.Bits, &size, &cursor, &lm.FPEKey, &lm.MaxExp, &lm.State, &lm.CreatedAt, &lm.ArchivedAt, &lm.ShardID, &lm.Purged, &lm.PurgedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
@@ -318,11 +330,71 @@ func (m *MetaStore) ArchivedListsPastRetention(ctx context.Context, cutoff time.
 
 // MarkPurged records that a list's Redis bitmap has been dropped, so
 // later GC sweeps don't keep re-issuing the (harmless but wasteful)
-// delete against an already-purged key forever.
+// delete against an already-purged key forever. Also stamps purged_at,
+// starting DBRetentionPeriod's clock (§22).
 func (m *MetaStore) MarkPurged(ctx context.Context, listID string) error {
-	_, err := m.pool.Exec(ctx, `UPDATE lists SET purged = true WHERE id = $1`, listID)
+	_, err := m.pool.Exec(ctx, `UPDATE lists SET purged = true, purged_at = now() WHERE id = $1`, listID)
 	if err != nil {
 		return fmt.Errorf("store: mark list %s purged: %w", listID, err)
+	}
+	return nil
+}
+
+// PurgedListsPastDBRetention returns purged lists whose Redis bitmap has
+// been gone for at least DBRetentionPeriod (`purged_at <= cutoff`) — the
+// second, independently-configured retention tier (§22) that decides
+// when it's finally safe to hard-delete a list's row (and its
+// allocations) from Postgres entirely, distinct from GCRetentionPeriod's
+// shorter Redis-purge/410-response window above. Callers must not call
+// this with a zero cutoff derived from a disabled (zero-value)
+// DBRetentionPeriod — see internal/gc.Sweeper.Sweep, which never invokes
+// this phase unless DBRetention > 0.
+func (m *MetaStore) PurgedListsPastDBRetention(ctx context.Context, cutoff time.Time) ([]*ListMeta, error) {
+	rows, err := m.pool.Query(ctx,
+		`SELECT `+listColumns+` FROM lists
+		  WHERE purged = true AND purged_at <= $1
+		  ORDER BY created_at ASC`,
+		cutoff,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: query purged lists past db retention: %w", err)
+	}
+	defer rows.Close()
+	var out []*ListMeta
+	for rows.Next() {
+		lm, err := scanListMeta(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: scan list: %w", err)
+		}
+		out = append(out, lm)
+	}
+	return out, rows.Err()
+}
+
+// DeleteList permanently removes listID's row and every allocation
+// recorded against it (§22's DB-retention hard-delete — the audit-
+// history / ownership records this data represents are gone after this,
+// not just the Redis bitmap MarkPurged already recorded as dropped).
+// Both deletes happen in one transaction so a crash between them can't leave
+// an orphaned allocations row with no parent list. issuer_usage is
+// deliberately untouched: it's a running per-issuer total, not a
+// per-list record, and this list's contribution to that count already
+// happened and stays true regardless of whether this row still exists.
+func (m *MetaStore) DeleteList(ctx context.Context, listID string) error {
+	tx, err := m.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("store: begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op if committed
+
+	if _, err := tx.Exec(ctx, `DELETE FROM allocations WHERE list_id = $1`, listID); err != nil {
+		return fmt.Errorf("store: delete allocations for list %s: %w", listID, err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM lists WHERE id = $1`, listID); err != nil {
+		return fmt.Errorf("store: delete list %s: %w", listID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("store: commit delete of list %s: %w", listID, err)
 	}
 	return nil
 }

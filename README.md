@@ -352,10 +352,11 @@ These are intentionally deferred, not oversights:
 - **`/metrics` is unauthenticated on the same public hostname as
   everything else**: acceptable for a test deployment, not something to
   carry into a production posture unreviewed (docs/design.md §21).
-- **GC row cleanup**: `internal/gc` drops a list's Redis bitmap once past
-  retention, but its Postgres row (metadata + ownership records) is kept
-  indefinitely — needed for `410` semantics and audit history. Revisit
-  only if that metadata's own storage becomes worth reclaiming.
+- ~~**GC row cleanup**~~: implemented (docs/design.md §22) — `internal/gc`
+  can now hard-delete a purged list's Postgres row and its allocations
+  after `DB_RETENTION_PERIOD`, **disabled by default** (rows kept forever
+  unless a deployment explicitly opts in, since some have real audit-
+  history/compliance reasons not to).
 - **Expiry-bucketed pools (§8.3)**: not implemented — needs real
   traffic data to size buckets sensibly.
 - **Target-based rotation knob (§8.2)**: only the raw knobs exist; the

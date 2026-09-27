@@ -88,6 +88,13 @@ type IngestionConfig struct {
 	GCGracePeriod     time.Duration
 	GCRetentionPeriod time.Duration
 	GCCheckInterval   time.Duration
+	// DBRetentionPeriod is how long after a list's Redis bitmap is
+	// purged before its Postgres row (and every allocation recorded
+	// against it) is hard-deleted (§22). Zero (the default) disables
+	// this phase entirely — rows are kept forever, since some
+	// deployments have real audit-history/compliance reasons to never
+	// delete them; enable deliberately, per deployment.
+	DBRetentionPeriod time.Duration
 
 	// SigningKey signs StatusListTokens; SigningKeyID is placed in the
 	// JWS `kid` header — must match across every ingestion shard and the
@@ -125,6 +132,7 @@ func LoadIngestion() (*IngestionConfig, error) {
 		GCGracePeriod:       24 * time.Hour,
 		GCRetentionPeriod:   30 * 24 * time.Hour,
 		GCCheckInterval:     time.Hour,
+		DBRetentionPeriod:   0, // disabled by default (§22): rows kept forever unless explicitly enabled
 		SigningKeyID:        getEnv("SIGNING_KEY_ID", "prototype-1"),
 		AccessTokenIssuer:   os.Getenv("ACCESS_TOKEN_ISSUER"),
 		AccessTokenAudience: getEnv("ACCESS_TOKEN_AUDIENCE", "siros-status-service"),
@@ -168,6 +176,9 @@ func LoadIngestion() (*IngestionConfig, error) {
 		return nil, err
 	}
 	if c.GCCheckInterval, err = getDurationEnv("GC_CHECK_INTERVAL", c.GCCheckInterval); err != nil {
+		return nil, err
+	}
+	if c.DBRetentionPeriod, err = getDurationEnv("DB_RETENTION_PERIOD", c.DBRetentionPeriod); err != nil {
 		return nil, err
 	}
 	if c.JWKSRefreshInterval, err = getDurationEnv("JWKS_REFRESH_INTERVAL", c.JWKSRefreshInterval); err != nil {

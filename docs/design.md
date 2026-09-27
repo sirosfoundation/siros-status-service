@@ -1123,3 +1123,45 @@ autoscaler is ever worth building, not something to build alongside it);
 access control on `/metrics` itself (it rides the same public hostname
 as everything else on a given app today — an accepted gap for a test
 deployment, not something to carry into a production posture unreviewed).
+
+## 22. Postgres row cleanup: a second, independent retention tier
+
+**The gap:** `internal/gc` (§7 point 4) drops a list's Redis bitmap once
+past `GC_RETENTION_PERIOD`, but always kept its Postgres `lists` row (and
+every `allocations` row referencing it) forever — needed for `410`
+semantics within the retention window, and for audit history after it. A
+sizing exercise for a concrete workload (20M users, 1yr credential
+validity, steady-state ~20M allocations/year) put a real number on that:
+with zero cleanup, the `allocations` table grows to ~100M rows (~15GB)
+after 5 years. Not urgent, but the kind of thing worth fixing before it's
+urgent rather than after.
+
+**Decided:** a second, independently-configured retention tier,
+deliberately **disabled by default**. `DB_RETENTION_PERIOD` (0 = off) on
+`cmd/ingestion-service` — how long after a list's Redis bitmap is purged
+(`purged_at`, a new column alongside the existing `purged` boolean)
+before its Postgres row and every `allocations` row referencing it are
+hard-deleted, in one transaction (`store.DeleteList`). `internal/gc.Sweeper`
+gained a third phase alongside archive/purge: find purged lists past
+`DB_RETENTION_PERIOD` (`PurgedListsPastDBRetention`) and delete them
+(`metrics.IngestionGCRowsDeletedTotal` counts this).
+
+**Why disabled by default, not just a long default duration:** the
+existing "kept forever" behavior exists specifically *because* some
+deployments have real audit-history or compliance reasons to never
+delete this data — a nonzero default would silently change that
+guarantee for every existing deployment on upgrade. Enabling deletion is
+a deliberate, per-deployment decision, not something this service should
+default into.
+
+**`issuer_usage` is untouched by this.** It's a running per-issuer total
+(docs/design.md §15.4), not a per-list record — a list's contribution to
+that count already happened and stays true regardless of whether the
+list's own row still exists. Deleting it here would silently corrupt an
+issuer's own accounting.
+
+**Verified live** against a local Postgres/Redis: allocate (1-slot list,
+so it fills and freezes immediately) → sweep archives it → sweep purges
+the Redis bitmap and stamps `purged_at` → sweep (with `DBRetention` now
+enabled) hard-deletes the row and its allocation, confirmed via
+`CheckOwnership` correctly reporting "no allocation" afterward.

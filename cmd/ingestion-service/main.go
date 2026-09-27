@@ -79,7 +79,7 @@ func run() error {
 
 	pub := publisher.New(map[string]*store.BitmapStore{cfg.ShardID: bitmaps}, meta, cfg.SigningKey, cfg.SigningKeyID, cfg.BaseURL)
 	pm := pool.NewManager(meta, bitmaps, cfg.ShardID, cfg.PoolWidth, cfg.ListCapacity, cfg.ListBits, cfg.RotationMaxAge)
-	sweeper := gc.NewSweeper(meta, bitmaps, cfg.GCGracePeriod, cfg.GCRetentionPeriod)
+	sweeper := gc.NewSweeper(meta, bitmaps, cfg.GCGracePeriod, cfg.GCRetentionPeriod, cfg.DBRetentionPeriod)
 	// §17: off by default (DecoyNoiseRate == 0 makes Sweep a no-op), opt in
 	// via DECOY_NOISE_RATE.
 	noiser := decoy.NewNoiser(meta, bitmaps, pub, cfg.ShardID, cfg.DecoyNoiseRate, cfg.DefaultTTLSeconds)

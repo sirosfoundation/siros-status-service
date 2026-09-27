@@ -55,6 +55,7 @@ Config struct: `internal/config.IngestionConfig`
 | `GCGracePeriod` | `GC_GRACE_PERIOD` | `24h0m0s` | GCGracePeriod, GCRetentionPeriod, and GCCheckInterval configure internal/gc's archive/purge sweep (§7 point 4) — see VerifierConfig.GCRetentionPeriod's own comment for why the verifier needs a copy of just that one value. |
 | `GCRetentionPeriod` | `GC_RETENTION_PERIOD` | `720h0m0s` |  |
 | `GCCheckInterval` | `GC_CHECK_INTERVAL` | `1h0m0s` |  |
+| `DBRetentionPeriod` | `DB_RETENTION_PERIOD` | `0` | DBRetentionPeriod is how long after a list's Redis bitmap is purged before its Postgres row (and every allocation recorded against it) is hard-deleted (§22). Zero (the default) disables this phase entirely — rows are kept forever, since some deployments have real audit-history/compliance reasons to never delete them; enable deliberately, per deployment. |
 | `SigningKey` | `SIGNING_KEY_PEM` | *(required)* (PEM-encoded EC private key) | SigningKey signs StatusListTokens; SigningKeyID is placed in the JWS `kid` header — must match across every ingestion shard and the verifier (one signing identity). |
 | `SigningKeyID` | `SIGNING_KEY_ID` | `prototype-1` |  |
 | `ASJWKSURL` | `AS_JWKS_URL` | *(required)* | ASJWKSURL, AccessTokenIssuer, and AccessTokenAudience configure offline access-token verification (§15.3) — the AS is never called on the request path, only its JWKS is fetched and cached. |

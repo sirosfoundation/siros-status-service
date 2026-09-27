@@ -143,6 +143,15 @@ var (
 		Help: "List Redis bitmaps purged past retention by internal/gc, by shard.",
 	}, []string{"shard_id"})
 
+	// IngestionGCRowsDeletedTotal counts hard-deleted list rows (docs/
+	// design.md §22) — only ever nonzero when DB_RETENTION_PERIOD is
+	// explicitly configured (disabled, i.e. rows kept forever, by
+	// default).
+	IngestionGCRowsDeletedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "ingestion_gc_rows_deleted_total",
+		Help: "List rows (and their allocations) hard-deleted past DB_RETENTION_PERIOD by internal/gc, by shard.",
+	}, []string{"shard_id"})
+
 	IngestionDecoyFlipsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "ingestion_decoy_flips_total",
 		Help: "Decoy-noise status flips applied by internal/decoy, by shard (docs/design.md §17).",
