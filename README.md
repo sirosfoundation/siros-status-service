@@ -95,6 +95,14 @@ signing keys: one for the AS, one shared by ingestion+verifier for
 StatusListTokens (they must match — both sides sign/verify the same
 token type), and one for a test issuer.
 
+`make test`/`go test ./...` needs Docker for the packages with real
+integration tests (`internal/gc`, `internal/as`, `tools/reassign-shard`
+— docs/design.md §24): `internal/testsupport` spins up throwaway
+Postgres/Redis containers per test via `testcontainers-go` and skips
+gracefully (`t.Skip`) if Docker isn't reachable, so this never fails a
+run without Docker, it just runs less of the suite. No CI changes
+needed — GitHub-hosted runners already have Docker preinstalled.
+
 ```sh
 make dev-up   # Postgres + Redis via docker compose (see compose.yaml for shard-b, add a second Redis for real sharding)
 

@@ -6,17 +6,26 @@ threshold:
 exclude:
   paths:
     - ^cmd/                               # entry points — not unit-testable
-    - ^tools/                             # one-off dev tooling (gen-fixture), not unit-testable
-    - ^internal/store/                    # Postgres/Redis clients — need live infra, not yet covered
-    - ^internal/ingestion/                # HTTP handlers wiring store+pool+publisher — same reason
+    - ^tools/gen-fixture/                 # one-off dev tooling, not unit-testable
+    - ^tools/loadtest/                    # drives a real deployment over HTTP, not unit-testable
+    - ^tools/gen-config-docs/             # code-generation script, not unit-testable
+    - ^internal/ingestion/                # HTTP handlers wiring store+pool+publisher — needs live infra
     - ^internal/verifier/                 # same reason
-    - ^internal/as/                       # AS server/handlers/shard assignment — needs live Postgres+HTTP
+    - ^internal/as/(server|handlers)\.go$ # AS's HTTP surface — needs live Postgres+HTTP; shard.go
+                                           # (issuer-shard assignment/reassignment, §23) is NOT excluded
+                                           # here — it's now covered by internal/testsupport-backed
+                                           # integration tests (real Postgres via testcontainers-go).
     - ^internal/pgutil/                   # advisory-locked DDL helper — needs live Postgres
     - ^internal/publisher/publisher\.go$   # orchestrates store + signing — needs live infra, same reason.
                                            # debounce.go (the leadingDebouncer coalescing logic, §9) is
                                            # pure and fully unit-tested, so it's NOT excluded here.
     - ^internal/config/                   # thin env-var loader, low value to unit test in isolation
-    - ^internal/gc/                       # archive/purge sweep — needs live Postgres/Redis, same reason
+    - ^internal/metrics/                  # promauto declarations + thin wrappers around live
+                                           # pgxpool.Stat/redis.PoolStats — genuinely low value to unit
+                                           # test in isolation (pgxpool.Stat has no exported constructor,
+                                           # so a fake one can't even be built without a real pool); the
+                                           # metrics themselves get real exercise via every other
+                                           # package's integration tests, just not attributed here.
 override:
   # internal/pool's pure selection logic (ChooseByPowerOfTwo) is fully
   # tested; Manager's methods (EnsureHealthy, PickForAllocation, Run,
@@ -34,3 +43,29 @@ override:
     path: ^internal/decoy$
   - threshold: 10
     path: ^internal/decoy/decoy\.go$
+  # internal/gc, internal/store, and tools/reassign-shard (docs/design.md
+  # §22/§23) are now covered by real integration tests
+  # (internal/testsupport, testcontainers-go — real Postgres/Redis, no
+  # mocks) rather than being fully excluded like the packages above: real,
+  # measured coverage, just not yet at the repo's normal 70% bar. Each
+  # threshold below is set a little under its actual measured number
+  # (`go tool cover -func`) — headroom against minor fluctuation, not a
+  # number chosen to look good. Run/main/flag-parsing entry points
+  # (gc.Sweeper.Run, reassign-shard's main/run) are the main reason these
+  # aren't at 70% themselves; the rest of each file — the actual
+  # archive/purge/delete logic, the actual reassignment logic — is well
+  # covered.
+  - threshold: 60
+    path: ^internal/gc$
+  - threshold: 60
+    path: ^internal/gc/sweeper\.go$
+  - threshold: 45
+    path: ^internal/store$
+  - threshold: 50
+    path: ^internal/store/postgres\.go$
+  - threshold: 25
+    path: ^internal/store/redis\.go$
+  - threshold: 60
+    path: ^tools/reassign-shard$
+  - threshold: 60
+    path: ^tools/reassign-shard/main\.go$
