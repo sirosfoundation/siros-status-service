@@ -91,6 +91,51 @@ func (a *ShardAssigner) AssignOrLookup(ctx context.Context, issuerID string) (st
 	return shardID, nil
 }
 
+// Reassign points issuerID at newShard for all future allocations
+// (docs/design.md §23) — deliberately the *only* thing it changes.
+// issuerID's already-issued credentials keep the shard_id recorded on
+// their own list rows forever, from whenever they were actually
+// allocated; nothing about them moves. Returns the issuer's previous
+// shard, or "" if they'd never been assigned one (treated as a normal
+// first assignment, not an error — tools/reassign-shard's bulk mode
+// doesn't need to special-case it).
+func (a *ShardAssigner) Reassign(ctx context.Context, issuerID, newShard string) (oldShard string, err error) {
+	err = a.pool.QueryRow(ctx, `SELECT shard_id FROM issuer_shard WHERE issuer_id = $1`, issuerID).Scan(&oldShard)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("as: look up current shard for %s: %w", issuerID, err)
+	}
+
+	if _, err := a.pool.Exec(ctx,
+		`INSERT INTO issuer_shard (issuer_id, shard_id) VALUES ($1, $2)
+		 ON CONFLICT (issuer_id) DO UPDATE SET shard_id = EXCLUDED.shard_id`,
+		issuerID, newShard,
+	); err != nil {
+		return "", fmt.Errorf("as: reassign %s to %s: %w", issuerID, newShard, err)
+	}
+	return oldShard, nil
+}
+
+// ListIssuersOnShard returns every issuer currently assigned to shard —
+// the population tools/reassign-shard's bulk ("empty this whole shard")
+// mode moves.
+func (a *ShardAssigner) ListIssuersOnShard(ctx context.Context, shard string) ([]string, error) {
+	rows, err := a.pool.Query(ctx, `SELECT issuer_id FROM issuer_shard WHERE shard_id = $1 ORDER BY issuer_id`, shard)
+	if err != nil {
+		return nil, fmt.Errorf("as: list issuers on shard %s: %w", shard, err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("as: scan issuer row: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 func hashIndex(s string, n int) int {
 	sum := sha256.Sum256([]byte(s))
 	return int(binary.BigEndian.Uint64(sum[:8]) % uint64(n))

@@ -14,12 +14,12 @@ package pool
 import (
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"log/slog"
 	mathrand "math/rand/v2"
 	"time"
 
 	"github.com/sirosfoundation/siros-status-service/internal/allocator"
+	"github.com/sirosfoundation/siros-status-service/internal/listid"
 	"github.com/sirosfoundation/siros-status-service/internal/metrics"
 	"github.com/sirosfoundation/siros-status-service/internal/store"
 )
@@ -124,7 +124,7 @@ func (m *Manager) EnsureHealthy(ctx context.Context) error {
 }
 
 func (m *Manager) createList(ctx context.Context) (*store.ListMeta, error) {
-	id, err := randomID()
+	id, err := listid.New(m.ShardID)
 	if err != nil {
 		return nil, err
 	}
@@ -163,17 +163,6 @@ func (m *Manager) PickForAllocation(ctx context.Context) (*store.ListMeta, error
 		}
 	}
 	return ChooseByPowerOfTwo(active, m.rand), nil
-}
-
-// randomID generates an opaque, unguessable list identifier
-// (docs/design.md §4: "a sequential list_id leaks issuance volume/rate
-// the same way sequential indices would").
-func randomID() (string, error) {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
 }
 
 // Run periodically calls EnsureHealthy until ctx is canceled. Rotation

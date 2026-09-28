@@ -1165,3 +1165,75 @@ so it fills and freezes immediately) → sweep archives it → sweep purges
 the Redis bitmap and stamps `purged_at` → sweep (with `DBRetention` now
 enabled) hard-deletes the row and its allocation, confirmed via
 `CheckOwnership` correctly reporting "no allocation" afterward.
+
+## 23. Shard reassignment: emptying a shard of write traffic without waiting a year
+
+**The motivation**: a real production topology (multiple clouds, Fastly
+as traffic director — a broader design discussion this section doesn't
+re-litigate) needs a way to decommission or rebalance a region without
+passively waiting out `MAX_EXPIRY` (potentially a year+) for every
+credential ever issued there. §15.5's shard assignment was deliberately
+"sticky forever" with no mechanism to change it — that was fine until
+"empty this shard" became a real operational need.
+
+**Decided**: reassignment only ever changes one thing — the AS's
+`issuer_shard` row (`issuer_id -> shard_id`) — and never touches an
+issuer's *already-issued* credentials, which keep the `shard_id`
+recorded on their own `lists` rows forever, from whenever they were
+actually allocated. Two new `internal/as.ShardAssigner` methods
+(`Reassign`, `ListIssuersOnShard`) back a new operational CLI,
+`tools/reassign-shard` — a deliberate, infrequent, operator-driven
+action against the AS's Postgres directly, not a new admin API endpoint
+(this repo's existing convention for rare operational tools, e.g.
+`tools/loadtest`, rather than building admin-auth machinery for
+something this rare). Supports single-issuer moves (rebalancing) and
+bulk "empty this whole shard" moves, split round-robin across multiple
+target shards so an emptied shard's traffic doesn't just create a new
+hotspot on one destination. "Stop *new* issuers landing on a shard"
+needed no new mechanism at all — removing it from `SHARDS` already
+does that, since `AssignOrLookup` only ever picks new-issuer candidates
+from that configured list.
+
+**"Stop new issuers landing here" + "move existing issuers off" +
+watch `ingestion_allocate_total{shard_id=...}`/`ingestion_pool_active_lists{shard_id=...}`
+(§21) flatline + wait out `MAX_EXPIRY`/`GC_GRACE_PERIOD`/`GC_RETENTION_PERIOD`
++ `DB_RETENTION_PERIOD` (§22) finally clears the Postgres rows** is now a
+complete, concrete region-decommission procedure — every step is
+something this service actually has, not aspirational.
+
+**The correctness problem this surfaced**: `cmd/ingress-router` routed
+*every* request by the caller's token's `tenant_id` claim (§15.6). That's
+fine when assignment never changes, but breaks the moment it can: an
+issuer reassigned from shard A to shard B gets a fresh token claiming
+shard B, then tries to `PATCH /status` on a credential issued *before*
+the reassignment — which lives in a list on shard A. Routing by
+`tenant_id` sends that request to shard B, which has no way to know
+anything about a list it never created (and, under a fully
+region-partitioned Postgres, couldn't even look it up).
+
+**Fix**: routing is now per-request-type, not uniformly token-driven.
+`/allocate` and `/accounting/me` reference no existing list — the
+token's *current* `tenant_id` claim is exactly right for those, unchanged.
+`PATCH /status/{listID}/{idx}` names a *specific, already-existing*
+list, so it routes by **that list's own permanent shard** instead. For
+that to be resolvable without a database lookup, list IDs now embed
+their creating shard (`internal/listid`, e.g. `iad.a1b2c3...` —
+`pool.Manager.createList` already knows its own `ShardID`) — a tiny,
+dependency-free package deliberately kept separate from
+`internal/pool`/`internal/store` so `cmd/ingress-router` (otherwise a
+stateless proxy with no database dependency at all) doesn't gain a
+Postgres/Redis driver it has no other use for. A list ID that predates
+this scheme (no embedded shard) or whose embedded shard isn't configured
+falls back to the token's claim — the only signal that existed before
+this, so it's the correct fallback, not a new failure mode.
+
+**Verified**: unit tests cover the actual property that matters — a
+token claiming shard B correctly still routes a `/status` request to
+shard A when the list ID says so (`TestRouter_StatusRoutesByListShardNotTokenClaim`),
+plus both fallback cases (legacy ID, unconfigured embedded shard) and
+confirmation that `/allocate` is unaffected. The reassignment CLI itself
+was run live against a local Postgres: single-issuer move, bulk move
+with a round-robin split across two target shards, and the
+first-assignment-via-reassign edge case (an issuer with no prior
+assignment), all confirmed by reading the `issuer_shard` table back
+directly.

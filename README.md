@@ -33,7 +33,10 @@ Four services (docs/design.md §15), each its own binary under `cmd/`:
   PDP already has an equivalent whitelist-registry mode.) On success,
   mints an access token shaped as `go-tokenauth/claims.AccessTokenClaims`
   (`internal/accesstoken`), assigning the issuer to a shard on first
-  request (`internal/as/shard.go`, sticky thereafter).
+  request (`internal/as/shard.go`, sticky thereafter — an operator can
+  move an issuer to a different shard for future allocations with
+  `tools/reassign-shard`, docs/design.md §23; already-issued credentials
+  are never affected by this).
 - **`cmd/ingestion-service`** (`internal/ingestion`) — issuer-facing:
   `POST /allocate`, `PATCH /status/{listID}/{idx}`,
   `GET /accounting/me`. One process = one shard. Verifies access tokens
