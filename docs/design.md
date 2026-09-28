@@ -80,7 +80,7 @@ Per list, store only:
 
 | field | purpose |
 |---|---|
-| `list_id` | opaque, **randomly generated** (a sequential list_id leaks issuance volume/rate the same way sequential indices would) |
+| `list_id` | opaque, **shard-prefixed + randomly generated** (`internal/listid`, §23 — e.g. `iad.a1b2c3...`; the random suffix is still the only unguessable part, a sequential list_id would leak issuance volume/rate the same way sequential indices would; the shard prefix is deliberately public — see §23 for why it needs to be) |
 | `bits` | 1/2/4/8, per spec |
 | `size` (N) | capacity |
 | `cursor` | next unallocated position, 0..N |
@@ -310,6 +310,18 @@ lifetimes.
 
 ## 11. Scaling
 
+**Superseded by what was actually built** (§15.5, §23): this section's
+"shard by `hash(list_id)`" scheme was written before real sharding was
+decided, and isn't what exists today. The real design shards by *issuer*
+assignment — an issuer is stuck to one shard at first token issuance
+(`issuer_shard`, §15.5), and every list it ever causes to be created
+inherits that shard — not by hashing an already-created list's ID
+afterward. `list_id` does still encode its shard (`internal/listid`,
+§23), but as a record of *which shard's issuer-assignment created it*,
+not as an input to a placement function. Kept below for the general
+"lists don't interact, so sharding is embarrassingly parallel" reasoning,
+which still holds — just not the specific hash-based mechanism.
+
 - Verifier reads are anonymous and heavily cacheable — put a CDN in front of
   them; this is where a large number of lists actually costs money, and CDN
   caching neutralizes it almost entirely given `ttl`-bounded staleness is
@@ -331,6 +343,14 @@ lifetimes.
   rebalancing job).
 
 ## 12. Deployment path: Fly prototype → sharded fleet
+
+**"Phase 2" below shares §11's superseded premise** (hash-based `list_id`
+placement/rebalancing) — the real Phase 1→2 path that actually happened
+is §15 (multi-service split, issuer-sticky sharding) and §18 (multi-region
+Fly), with §23 adding the operational lever this section only imagined
+("a rebalancing job"): `tools/reassign-shard` moves *issuers* between
+shards, not list-ID hash ranges. Kept for the Fly-prototype-first framing
+in Phase 1, which held up.
 
 Two deployment targets are in scope, and the architecture above is meant to
 support both without a rewrite in between:
