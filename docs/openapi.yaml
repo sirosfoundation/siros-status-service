@@ -354,7 +354,12 @@ paths:
                   Signed Status List Token (JWT). Payload carries
                   `sub` (this list's own URL), `iat`, `ttl`, and
                   `status_list: {bits, lst}` per
-                  draft-ietf-oauth-status-list-21 §4.1/§5.1.
+                  draft-ietf-oauth-status-list-21 §4.1/§5.1. The JWS
+                  header carries whatever key-discovery material this
+                  deployment's signing key can offer, RFC 7515: an
+                  `x5c` chain (§4.1.6, leaf first), a bare `jwk`
+                  (§4.1.3), both, or (a signing key with no associated
+                  certificate) neither — do not assume which.
         "304":
           description: Not modified (If-None-Match matched)
         "404":

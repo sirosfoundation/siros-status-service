@@ -1322,3 +1322,106 @@ fixed by excluding it with the same honesty: it's mostly promauto
 declarations and thin wrappers around `pgxpool.Stat` (no exported
 constructor, so not fakeable without a real pool anyway), genuinely low
 value to unit test in isolation.
+
+## 25. Trust discovery for the StatusListToken signing key: `jwk`/`x5c` headers
+
+**The gap:** every published StatusListToken (§5.1's JWT form) was
+signed, but a verifier had no standard way to discover the corresponding
+public key at all — `status.siros.org`'s own API reference had to say so
+explicitly ("there is no JWKS endpoint yet for the StatusListToken
+signing key"). A verifier that already knew the key out-of-band could
+still validate a token; anyone else, including a verifier trying to
+*evaluate trust* in the signer (chain it to a real trust list) rather
+than just check the signature, had no path in.
+
+**Decided:** `statuslist.BuildToken` (`internal/statuslist/token.go`) now
+embeds, at the issuer's option, the same two proof types §20 already
+established for client assertions — `jwk` (RFC 7515 §4.1.3, a bare
+`{kty,crv,x,y}` map, built by the new `JWKFromPublicKey`) and/or `x5c`
+(RFC 7515 §4.1.6, base64-STANDARD-encoded DER certificates, leaf first).
+Unlike a client assertion's proof of possession, which requires exactly
+one, `jwk` and `x5c` are independent here — a status list signer's own
+key is not a secret proving identity the way an issuer's assertion key
+is, so a deployment may publish both, either alone, or (if its signing
+key has no associated certificate) neither, falling back to this
+service's original, more limited behavior of decoding the list's
+contents without a trust decision.
+
+`internal/publisher.Publisher` derives the `jwk` once, at construction,
+from the configured signing key's own public half (`New` now returns an
+error if that public key isn't ECDSA — a configuration mistake caught at
+startup, not at the first publish), and carries an optional `certChain`
+alongside it; both are attached to every token `PublishIfStale` builds.
+
+**Left open:** there is still no COSE/CBOR equivalent decision made here
+— see §26's note on the PKCS#11 signing abstraction generalizing cleanly
+to a CWT wire format, and the separate, still-undecided question of how
+(or whether) `jwk`'s bare-key trust-discovery case would be represented
+in COSE, which has no standard header for it (`x5chain`, RFC 9360, is
+the direct COSE analogue of `x5c` and would carry over easily).
+
+## 26. PKCS#11-backed signing for StatusListTokens
+
+**The gap:** the signing key configured via `SIGNING_KEY_PEM` lived as a
+parsed `*ecdsa.PrivateKey` in the ingestion/verifier process's own
+memory for the life of the process — fine for the Fly prototype, not
+something every real deployment can accept. An issuer running this
+service against its own compliance requirements may need the private
+key to never leave a hardware security module at all.
+
+**Decided:** signing now goes through the standard library's
+`crypto.Signer` interface everywhere instead of a concrete
+`*ecdsa.PrivateKey` — both an in-memory key and a PKCS#11-backed one
+implement it identically, and (Go's own convention for `crypto.Signer` +
+ECDSA) both return an ASN.1 DER-encoded signature from `Sign`, which is
+what makes one code path serve both:
+
+- `internal/config.SigningSource` is a sum-type-like struct (exactly one
+  of `Key`/`PKCS11` populated), resolved once at config-load time by
+  `loadSigningSource`. Unset `PKCS11_MODULE_PATH` (the default) preserves
+  every existing deployment's behavior exactly — `SIGNING_KEY_PEM` is
+  still required and nothing else changes. Setting it opt-in requires
+  `PKCS11_TOKEN_LABEL`, `PKCS11_KEY_LABEL`, and `PKCS11_PIN`
+  (`PKCS11_POOL_SIZE` optional, default 4); setting *both* a PEM key and
+  a module path is rejected outright rather than silently preferring
+  one. Selection is always by token/key *label*, never a raw slot
+  number or `CKA_ID` — a label is what an operator actually provisions
+  the HSM with, and unlike a slot number it can't be silently ambiguous
+  with "unset" the way `0` (a valid real slot) would be against
+  `getIntEnv`'s zero-value default.
+- `internal/signing.NewSigner` is the only place that actually opens a
+  PKCS#11 session: it turns a `SigningSource` into a `(crypto.Signer,
+  io.Closer, error)`, using
+  `github.com/sirosfoundation/go-cryptoutil/pkcs11pool` (already
+  published, already used elsewhere in the org) for real session
+  pooling/recovery/retry against the module. Deliberately its own
+  package, not folded into `internal/config`, matching this service's
+  existing separation between config-as-thin-env-loader and the real,
+  potentially-failing I/O `cmd/*/main.go` already does for Postgres and
+  Redis.
+- `golang-jwt/jwt/v5`'s stock `jwt.SigningMethodES256` only accepts a
+  concrete `*ecdsa.PrivateKey` internally, so it cannot sign through a
+  `pkcs11pool.Signer` (deliberately: the private key never leaves the
+  HSM, so there is no `*ecdsa.PrivateKey` to hand it at all). The new
+  `internal/statuslist.es256CryptoSignerMethod` signs generically through
+  `crypto.Signer` instead — SHA-256 the signing input, call `Sign`, then
+  convert the ASN.1 DER result to JWS's required raw `r‖s` (RFC 7518
+  §3.4) via `asn1ToRawECDSA`. The wire format produced is byte-for-byte
+  identical to the stock method's, so verification (`ParseToken`, any
+  real verifier) is completely unaffected by which method signed a given
+  token.
+
+**Scope, deliberately**: this covers only StatusListToken signing
+(`IngestionConfig`/`VerifierConfig`). The AS's own access-token signing
+key (`AS_SIGNING_KEY_PEM`, §15.2) was left untouched — a different
+service, a different trust boundary (§15.8), and not what "list
+signatures" was asking for.
+
+**Verified live**, not just unit-tested: `internal/signing`'s test suite
+initializes a real (software) SoftHSM2 token via `softhsm2-util`/
+`pkcs11-tool` — the same harness `go-cryptoutil/pkcs11pool`'s own tests
+use — generates a real P-256 keypair on it, and signs and verifies a
+real StatusListToken end to end through it, including confirming a
+second, freshly-opened pool against the same token produces signatures
+verifiable against the same public key (proving the key is durable on
+the token, not an artifact of one in-process pool).

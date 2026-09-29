@@ -56,8 +56,9 @@ Config struct: `internal/config.IngestionConfig`
 | `GCRetentionPeriod` | `GC_RETENTION_PERIOD` | `720h0m0s` |  |
 | `GCCheckInterval` | `GC_CHECK_INTERVAL` | `1h0m0s` |  |
 | `DBRetentionPeriod` | `DB_RETENTION_PERIOD` | `0` | DBRetentionPeriod is how long after a list's Redis bitmap is purged before its Postgres row (and every allocation recorded against it) is hard-deleted (§22). Zero (the default) disables this phase entirely — rows are kept forever, since some deployments have real audit-history/compliance reasons to never delete them; enable deliberately, per deployment. |
-| `SigningKey` | `SIGNING_KEY_PEM` | *(required)* (PEM-encoded EC private key) | SigningKey signs StatusListTokens; SigningKeyID is placed in the JWS `kid` header — must match across every ingestion shard and the verifier (one signing identity). |
+| `Signing` | — | — | Signing is where StatusListTokens' signing key actually comes from: SIGNING_KEY_PEM (PEM-encoded EC private key, the default), or, opt-in, a PKCS#11 HSM via PKCS11_MODULE_PATH + PKCS11_TOKEN_LABEL + PKCS11_KEY_LABEL + PKCS11_PIN (PKCS11_POOL_SIZE optional, default 4) — §26. Configure exactly one; must resolve to the same signing identity across every ingestion shard and the verifier. SigningKeyID is placed in the JWS `kid` header. |
 | `SigningKeyID` | `SIGNING_KEY_ID` | `prototype-1` |  |
+| `SigningCertChain` | — | — | SigningCertChain, from SIGNING_CERT_CHAIN_PEM (a PEM bundle, leaf first) if set, is embedded as the published StatusListToken's own `x5c` header (§25) — the signing key's certificate chain, letting a verifier evaluate trust in the signer, not just validate the signature. Optional: nil if this deployment's signing key has no associated certificate. |
 | `ASJWKSURL` | `AS_JWKS_URL` | *(required)* | ASJWKSURL, AccessTokenIssuer, and AccessTokenAudience configure offline access-token verification (§15.3) — the AS is never called on the request path, only its JWKS is fetched and cached. |
 | `AccessTokenIssuer` | `ACCESS_TOKEN_ISSUER` | *(required)* |  |
 | `AccessTokenAudience` | `ACCESS_TOKEN_AUDIENCE` | `siros-status-service` |  |
@@ -75,8 +76,9 @@ Config struct: `internal/config.VerifierConfig`
 | `ShardRedisURLs` | `SHARD_REDIS_URLS` | *(required)* (JSON object) | ShardRedisURLs maps shard_id -> that shard's Redis connection string, since a verifier may need to read any shard's bitmap depending on which shard a requested list belongs to (§15.5). |
 | `DefaultTTLSeconds` | `DEFAULT_TTL_SECONDS` | `3600` | DefaultTTLSeconds is the fallback cache lifetime applied when an issuer didn't set its own at allocation time (§9/§13). |
 | `GCRetentionPeriod` | `GC_RETENTION_PERIOD` | `720h0m0s` | GCRetentionPeriod must match the ingestion shards' own setting — it's how the verifier decides whether an ARCHIVED list is still within its serve-the-last-token window or should now 410 (§7 point 4, §13). GC itself (archiving, purging) still runs only on the ingestion side (internal/gc); the verifier only reads this value. |
-| `SigningKey` | `SIGNING_KEY_PEM` | *(required)* (PEM-encoded EC private key) | SigningKey signs StatusListTokens. |
+| `Signing` | — | — | Signing is where StatusListTokens' signing key actually comes from: SIGNING_KEY_PEM (PEM-encoded EC private key, the default), or, opt-in, a PKCS#11 HSM via PKCS11_MODULE_PATH + PKCS11_TOKEN_LABEL + PKCS11_KEY_LABEL + PKCS11_PIN (PKCS11_POOL_SIZE optional, default 4) — §26. Configure exactly one; must resolve to the same signing identity as every ingestion shard. |
 | `SigningKeyID` | `SIGNING_KEY_ID` | `prototype-1` | SigningKeyID is placed in the JWS `kid` header on published StatusListTokens — must match every ingestion shard's own value (one signing identity). |
+| `SigningCertChain` | — | — | SigningCertChain, from SIGNING_CERT_CHAIN_PEM (a PEM bundle, leaf first) if set, is embedded as the published StatusListToken's own `x5c` header (§25) — must match every ingestion shard's own value. |
 
 ## cmd/ingress-router
 

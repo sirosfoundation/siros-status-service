@@ -171,3 +171,138 @@ func TestBuildToken_HeaderTyp(t *testing.T) {
 		t.Errorf("alg = %q, want ES256", header.Alg)
 	}
 }
+
+func decodeTokenHeader(t *testing.T, token string) map[string]any {
+	t.Helper()
+	headerB64, _, ok := strings.Cut(token, ".")
+	if !ok {
+		t.Fatalf("expected a dot-separated JWT, got %q", token)
+	}
+	headerJSON, err := base64.RawURLEncoding.DecodeString(headerB64)
+	if err != nil {
+		t.Fatalf("decode header: %v", err)
+	}
+	var header map[string]any
+	if err := json.Unmarshal(headerJSON, &header); err != nil {
+		t.Fatalf("unmarshal header: %v", err)
+	}
+	return header
+}
+
+func TestJWKFromPublicKey(t *testing.T) {
+	key := testSigningKey(t)
+	jwk, err := JWKFromPublicKey(&key.PublicKey)
+	if err != nil {
+		t.Fatalf("JWKFromPublicKey: %v", err)
+	}
+	if jwk["kty"] != "EC" {
+		t.Errorf("kty = %v, want EC", jwk["kty"])
+	}
+	if jwk["crv"] != "P-256" {
+		t.Errorf("crv = %v, want P-256", jwk["crv"])
+	}
+	if jwk["x"] == nil || jwk["y"] == nil {
+		t.Errorf("expected x/y coordinates, got %v", jwk)
+	}
+	for _, unwanted := range []string{"kid", "alg", "use", "d"} {
+		if _, present := jwk[unwanted]; present {
+			t.Errorf("JWKFromPublicKey included %q, want a bare kty/crv/x/y JWK only", unwanted)
+		}
+	}
+}
+
+func TestBuildToken_JWKHeader(t *testing.T) {
+	key := testSigningKey(t)
+	jwk, err := JWKFromPublicKey(&key.PublicKey)
+	if err != nil {
+		t.Fatalf("JWKFromPublicKey: %v", err)
+	}
+	bm, err := NewBitmap(10, 1)
+	if err != nil {
+		t.Fatalf("NewBitmap: %v", err)
+	}
+	token, err := BuildToken(key, TokenParams{
+		ListURL:  "https://status.example.org/lists/abc",
+		IssuedAt: time.Now(),
+		Bitmap:   bm,
+		JWK:      jwk,
+	})
+	if err != nil {
+		t.Fatalf("BuildToken: %v", err)
+	}
+
+	header := decodeTokenHeader(t, token)
+	gotJWK, ok := header["jwk"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected header[\"jwk\"] to be an object, got %#v", header["jwk"])
+	}
+	if gotJWK["x"] != jwk["x"] || gotJWK["y"] != jwk["y"] {
+		t.Errorf("header jwk = %v, want it to match the embedded public key %v", gotJWK, jwk)
+	}
+
+	// A verifier that only has the token itself (no out-of-band key)
+	// must still be able to validate it purely from the embedded jwk.
+	claims, err := ParseToken(token, &key.PublicKey)
+	if err != nil {
+		t.Fatalf("ParseToken: %v", err)
+	}
+	if claims.Subject != "https://status.example.org/lists/abc" {
+		t.Errorf("sub = %q", claims.Subject)
+	}
+}
+
+func TestBuildToken_X5CHeader(t *testing.T) {
+	key := testSigningKey(t)
+	chain := []string{"leaf-cert-der-base64", "intermediate-cert-der-base64"}
+	bm, err := NewBitmap(10, 1)
+	if err != nil {
+		t.Fatalf("NewBitmap: %v", err)
+	}
+	token, err := BuildToken(key, TokenParams{
+		ListURL:  "https://status.example.org/lists/abc",
+		IssuedAt: time.Now(),
+		Bitmap:   bm,
+		X5C:      chain,
+	})
+	if err != nil {
+		t.Fatalf("BuildToken: %v", err)
+	}
+
+	header := decodeTokenHeader(t, token)
+	gotRaw, ok := header["x5c"].([]any)
+	if !ok {
+		t.Fatalf("expected header[\"x5c\"] to be an array, got %#v", header["x5c"])
+	}
+	if len(gotRaw) != len(chain) {
+		t.Fatalf("x5c has %d entries, want %d", len(gotRaw), len(chain))
+	}
+	for i, want := range chain {
+		if gotRaw[i] != want {
+			t.Errorf("x5c[%d] = %v, want %q", i, gotRaw[i], want)
+		}
+	}
+}
+
+func TestBuildToken_NoJWKOrX5CByDefault(t *testing.T) {
+	key := testSigningKey(t)
+	bm, err := NewBitmap(10, 1)
+	if err != nil {
+		t.Fatalf("NewBitmap: %v", err)
+	}
+	token, err := BuildToken(key, TokenParams{
+		ListURL:  "https://status.example.org/lists/abc",
+		IssuedAt: time.Now(),
+		Bitmap:   bm,
+	})
+	if err != nil {
+		t.Fatalf("BuildToken: %v", err)
+	}
+
+	header := decodeTokenHeader(t, token)
+	if _, present := header["jwk"]; present {
+		t.Error("expected no jwk header when TokenParams.JWK is nil")
+	}
+	if _, present := header["x5c"]; present {
+		t.Error("expected no x5c header when TokenParams.X5C is empty")
+	}
+}

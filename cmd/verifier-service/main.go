@@ -18,6 +18,7 @@ import (
 	"github.com/sirosfoundation/siros-status-service/internal/config"
 	"github.com/sirosfoundation/siros-status-service/internal/metrics"
 	"github.com/sirosfoundation/siros-status-service/internal/publisher"
+	"github.com/sirosfoundation/siros-status-service/internal/signing"
 	"github.com/sirosfoundation/siros-status-service/internal/store"
 	"github.com/sirosfoundation/siros-status-service/internal/verifier"
 )
@@ -69,7 +70,16 @@ func run() error {
 	defer meta.Close()
 	go metrics.WatchPostgresPool(ctx, poolStatsInterval, meta.Stat)
 
-	pub := publisher.New(bitmapsByShard, meta, cfg.SigningKey, cfg.SigningKeyID, cfg.BaseURL)
+	signer, signerCloser, err := signing.NewSigner(cfg.Signing)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = signerCloser.Close() }()
+
+	pub, err := publisher.New(bitmapsByShard, meta, signer, cfg.SigningKeyID, cfg.BaseURL, cfg.SigningCertChain)
+	if err != nil {
+		return err
+	}
 	srv := verifier.New(cfg, meta, pub)
 
 	httpSrv := &http.Server{Addr: cfg.HTTPAddr, Handler: srv.Router()}

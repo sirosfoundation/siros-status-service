@@ -10,6 +10,7 @@ package config
 import (
 	"crypto/ecdsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -96,11 +97,22 @@ type IngestionConfig struct {
 	// delete them; enable deliberately, per deployment.
 	DBRetentionPeriod time.Duration
 
-	// SigningKey signs StatusListTokens; SigningKeyID is placed in the
-	// JWS `kid` header — must match across every ingestion shard and the
-	// verifier (one signing identity).
-	SigningKey   *ecdsa.PrivateKey
+	// Signing is where StatusListTokens' signing key actually comes from:
+	// SIGNING_KEY_PEM (PEM-encoded EC private key, the default), or,
+	// opt-in, a PKCS#11 HSM via PKCS11_MODULE_PATH + PKCS11_TOKEN_LABEL +
+	// PKCS11_KEY_LABEL + PKCS11_PIN (PKCS11_POOL_SIZE optional, default
+	// 4) — §26. Configure exactly one; must resolve to the same signing
+	// identity across every ingestion shard and the verifier.
+	// SigningKeyID is placed in the JWS `kid` header.
+	Signing      SigningSource
 	SigningKeyID string
+	// SigningCertChain, from SIGNING_CERT_CHAIN_PEM (a PEM bundle, leaf
+	// first) if set, is embedded as the published StatusListToken's own
+	// `x5c` header (§25) — the signing key's certificate chain, letting a
+	// verifier evaluate trust in the signer, not just validate the
+	// signature. Optional: nil if this deployment's signing key has no
+	// associated certificate.
+	SigningCertChain []string
 
 	// ASJWKSURL, AccessTokenIssuer, and AccessTokenAudience configure
 	// offline access-token verification (§15.3) — the AS is never
@@ -184,7 +196,10 @@ func LoadIngestion() (*IngestionConfig, error) {
 	if c.JWKSRefreshInterval, err = getDurationEnv("JWKS_REFRESH_INTERVAL", c.JWKSRefreshInterval); err != nil {
 		return nil, err
 	}
-	if c.SigningKey, err = requireECKeyEnv("SIGNING_KEY_PEM"); err != nil {
+	if c.Signing, err = loadSigningSource("SIGNING_KEY_PEM"); err != nil {
+		return nil, err
+	}
+	if c.SigningCertChain, err = optionalCertChainEnv("SIGNING_CERT_CHAIN_PEM"); err != nil {
 		return nil, err
 	}
 
@@ -228,12 +243,21 @@ type VerifierConfig struct {
 	// ingestion side (internal/gc); the verifier only reads this value.
 	GCRetentionPeriod time.Duration
 
-	// SigningKey signs StatusListTokens.
-	SigningKey *ecdsa.PrivateKey
+	// Signing is where StatusListTokens' signing key actually comes from:
+	// SIGNING_KEY_PEM (PEM-encoded EC private key, the default), or,
+	// opt-in, a PKCS#11 HSM via PKCS11_MODULE_PATH + PKCS11_TOKEN_LABEL +
+	// PKCS11_KEY_LABEL + PKCS11_PIN (PKCS11_POOL_SIZE optional, default
+	// 4) — §26. Configure exactly one; must resolve to the same signing
+	// identity as every ingestion shard.
+	Signing SigningSource
 	// SigningKeyID is placed in the JWS `kid` header on published
 	// StatusListTokens — must match every ingestion shard's own value
 	// (one signing identity).
 	SigningKeyID string
+	// SigningCertChain, from SIGNING_CERT_CHAIN_PEM (a PEM bundle, leaf
+	// first) if set, is embedded as the published StatusListToken's own
+	// `x5c` header (§25) — must match every ingestion shard's own value.
+	SigningCertChain []string
 }
 
 func LoadVerifier() (*VerifierConfig, error) {
@@ -252,7 +276,10 @@ func LoadVerifier() (*VerifierConfig, error) {
 	if c.GCRetentionPeriod, err = getDurationEnv("GC_RETENTION_PERIOD", c.GCRetentionPeriod); err != nil {
 		return nil, err
 	}
-	if c.SigningKey, err = requireECKeyEnv("SIGNING_KEY_PEM"); err != nil {
+	if c.Signing, err = loadSigningSource("SIGNING_KEY_PEM"); err != nil {
+		return nil, err
+	}
+	if c.SigningCertChain, err = optionalCertChainEnv("SIGNING_CERT_CHAIN_PEM"); err != nil {
 		return nil, err
 	}
 
@@ -451,6 +478,91 @@ func getDurationEnv(key string, def time.Duration) (time.Duration, error) {
 	return d, nil
 }
 
+// SigningSource is where a StatusListToken signing identity actually
+// comes from (docs/design.md §26): exactly one of Key or PKCS11 is set.
+// Deliberately just data here — internal/config stays a thin env-var
+// loader with no PKCS#11 driver dependency; internal/signing is what
+// turns this into a real crypto.Signer, connecting to the HSM only if
+// PKCS11 is actually configured.
+type SigningSource struct {
+	Key    *ecdsa.PrivateKey
+	PKCS11 *PKCS11Config
+}
+
+// PKCS11Config configures a pooled PKCS#11 HSM signer
+// (github.com/sirosfoundation/go-cryptoutil/pkcs11pool).
+type PKCS11Config struct {
+	ModulePath string
+	// Exactly one of TokenLabel or SlotID identifies which slot to use;
+	// TokenLabel wins if both are set (matches pkcs11pool.Config's own
+	// precedence).
+	TokenLabel string
+	SlotID     uint
+	PIN        string
+	// KeyLabel identifies the key on the token (CKA_LABEL) — this
+	// service always selects by label, never by raw CKA_ID, since a
+	// human-assigned label is what an operator actually provisions the
+	// HSM with.
+	KeyLabel string
+	PoolSize int
+}
+
+// loadSigningSource resolves a StatusListToken signing identity from
+// the environment: PKCS11_MODULE_PATH set means PKCS#11 (§26, opt-in —
+// unset by default, so every existing deployment's behavior is
+// unchanged); otherwise pemEnvVar (e.g. SIGNING_KEY_PEM) is required,
+// matching this service's original, only-ever behavior. Configuring
+// both is rejected outright rather than silently preferring one — an
+// operator who set both almost certainly means something different than
+// either alone would do.
+func loadSigningSource(pemEnvVar string) (SigningSource, error) {
+	modulePath := os.Getenv("PKCS11_MODULE_PATH")
+	pemStr := os.Getenv(pemEnvVar)
+	if modulePath != "" && pemStr != "" {
+		return SigningSource{}, fmt.Errorf("config: both PKCS11_MODULE_PATH and %s are set — configure exactly one signing source", pemEnvVar)
+	}
+	if modulePath == "" {
+		key, err := requireECKeyEnv(pemEnvVar)
+		if err != nil {
+			return SigningSource{}, err
+		}
+		return SigningSource{Key: key}, nil
+	}
+
+	poolSize, err := getIntEnv("PKCS11_POOL_SIZE", 4)
+	if err != nil {
+		return SigningSource{}, err
+	}
+	// Selecting by token label (not raw slot number) is the primary path
+	// this service supports — a label is what an operator actually
+	// provisions the HSM with, and unlike a slot number it can't be
+	// silently ambiguous with "unset" (0 is both a valid real slot and
+	// getUint64Env's zero-value default). PKCS11Config.SlotID stays
+	// available on the struct for a future caller that wants it, but
+	// this loader doesn't validate or default it — TokenLabel is
+	// required here.
+	tokenLabel := os.Getenv("PKCS11_TOKEN_LABEL")
+	if tokenLabel == "" {
+		return SigningSource{}, fmt.Errorf("config: PKCS11_MODULE_PATH is set — PKCS11_TOKEN_LABEL is required")
+	}
+	keyLabel := os.Getenv("PKCS11_KEY_LABEL")
+	if keyLabel == "" {
+		return SigningSource{}, fmt.Errorf("config: PKCS11_MODULE_PATH is set — PKCS11_KEY_LABEL is required")
+	}
+	pin := os.Getenv("PKCS11_PIN")
+	if pin == "" {
+		return SigningSource{}, fmt.Errorf("config: PKCS11_MODULE_PATH is set — PKCS11_PIN is required")
+	}
+
+	return SigningSource{PKCS11: &PKCS11Config{
+		ModulePath: modulePath,
+		TokenLabel: tokenLabel,
+		PIN:        pin,
+		KeyLabel:   keyLabel,
+		PoolSize:   poolSize,
+	}}, nil
+}
+
 func requireECKeyEnv(key string) (*ecdsa.PrivateKey, error) {
 	pemStr := os.Getenv(key)
 	if pemStr == "" {
@@ -465,4 +577,36 @@ func requireECKeyEnv(key string) (*ecdsa.PrivateKey, error) {
 		return nil, fmt.Errorf("config: %s: parse EC private key: %w", key, err)
 	}
 	return k, nil
+}
+
+// optionalCertChainEnv parses a PEM bundle of one or more certificates
+// (concatenated, leaf first) into an x5c-shaped array — each entry
+// base64-STANDARD-encoded DER, matching internal/clientassertion's x5c
+// convention (RFC 7515 §4.1.6) — for embedding in published Status List
+// Tokens' own JWS header (docs/design.md §25). Unlike requireECKeyEnv,
+// unset is not an error: whether this deployment's signing key has an
+// associated certificate at all is optional, not required — nil, nil
+// means "no chain configured," not "misconfigured."
+func optionalCertChainEnv(key string) ([]string, error) {
+	pemStr := os.Getenv(key)
+	if pemStr == "" {
+		return nil, nil
+	}
+	rest := []byte(pemStr)
+	var chain []string
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		chain = append(chain, base64.StdEncoding.EncodeToString(block.Bytes))
+	}
+	if len(chain) == 0 {
+		return nil, fmt.Errorf("config: %s: no PEM CERTIFICATE block found", key)
+	}
+	return chain, nil
 }

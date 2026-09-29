@@ -21,6 +21,7 @@ import (
 	"github.com/sirosfoundation/siros-status-service/internal/metrics"
 	"github.com/sirosfoundation/siros-status-service/internal/pool"
 	"github.com/sirosfoundation/siros-status-service/internal/publisher"
+	"github.com/sirosfoundation/siros-status-service/internal/signing"
 	"github.com/sirosfoundation/siros-status-service/internal/store"
 )
 
@@ -77,7 +78,16 @@ func run() error {
 	})
 	validator.Start(ctx)
 
-	pub := publisher.New(map[string]*store.BitmapStore{cfg.ShardID: bitmaps}, meta, cfg.SigningKey, cfg.SigningKeyID, cfg.BaseURL)
+	signer, signerCloser, err := signing.NewSigner(cfg.Signing)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = signerCloser.Close() }()
+
+	pub, err := publisher.New(map[string]*store.BitmapStore{cfg.ShardID: bitmaps}, meta, signer, cfg.SigningKeyID, cfg.BaseURL, cfg.SigningCertChain)
+	if err != nil {
+		return err
+	}
 	pm := pool.NewManager(meta, bitmaps, cfg.ShardID, cfg.PoolWidth, cfg.ListCapacity, cfg.ListBits, cfg.RotationMaxAge)
 	sweeper := gc.NewSweeper(meta, bitmaps, cfg.GCGracePeriod, cfg.GCRetentionPeriod, cfg.DBRetentionPeriod)
 	// §17: off by default (DecoyNoiseRate == 0 makes Sweep a no-op), opt in

@@ -22,6 +22,7 @@ package publisher
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"fmt"
 	"log/slog"
@@ -51,9 +52,14 @@ type Publisher struct {
 	// shard's bitmap depending on which shard a given list belongs to.
 	bitmapsByShard map[string]*store.BitmapStore
 	meta           *store.MetaStore
-	key            *ecdsa.PrivateKey
-	keyID          string
-	baseURL        string
+	// key signs every published token — an in-memory *ecdsa.PrivateKey
+	// or a PKCS#11-backed signer (docs/design.md §26); both implement
+	// crypto.Signer identically as far as this package is concerned.
+	key       crypto.Signer
+	keyID     string
+	baseURL   string
+	jwk       map[string]any // key's own public half, embedded in every token (§25)
+	certChain []string       // optional: key's certificate chain, embedded if configured (§25)
 
 	mu    sync.RWMutex
 	cache map[string]*Published
@@ -61,16 +67,34 @@ type Publisher struct {
 	debounce *leadingDebouncer
 }
 
-func New(bitmapsByShard map[string]*store.BitmapStore, meta *store.MetaStore, key *ecdsa.PrivateKey, keyID, baseURL string) *Publisher {
+// New builds a Publisher. key must be an ECDSA (P-256) crypto.Signer —
+// an in-memory *ecdsa.PrivateKey or a PKCS#11-backed one
+// (internal/signing.NewSigner, docs/design.md §26). certChain is
+// optional (nil if this deployment's signing key has no associated
+// certificate) — see TokenParams.X5C's own doc comment for why JWK and
+// X5C are independent rather than mutually exclusive here, unlike a
+// client assertion's proof of possession.
+func New(bitmapsByShard map[string]*store.BitmapStore, meta *store.MetaStore, key crypto.Signer, keyID, baseURL string, certChain []string) (*Publisher, error) {
+	pub, ok := key.Public().(*ecdsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("publisher: signing key's public half is not ECDSA (got %T)", key.Public())
+	}
+	jwk, err := statuslist.JWKFromPublicKey(pub)
+	if err != nil {
+		return nil, fmt.Errorf("publisher: %w", err)
+	}
+
 	return &Publisher{
 		bitmapsByShard: bitmapsByShard,
 		meta:           meta,
 		key:            key,
 		keyID:          keyID,
 		baseURL:        baseURL,
+		jwk:            jwk,
+		certChain:      certChain,
 		cache:          make(map[string]*Published),
 		debounce:       newLeadingDebouncer(),
-	}
+	}, nil
 }
 
 // MarkDirty schedules a publish for listID shortly after a status write

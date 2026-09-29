@@ -3,12 +3,15 @@ package statuslist
 import (
 	"bytes"
 	"compress/zlib"
+	"crypto"
 	"crypto/ecdsa"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"time"
 
+	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
 )
 
@@ -79,11 +82,51 @@ type TokenParams struct {
 	Bitmap *Bitmap
 	// KeyID is placed in the JWS header (kid) if non-empty.
 	KeyID string
+	// JWK, if non-nil, is embedded in the JWS header (RFC 7515 §4.1.3) —
+	// the signing key's own public half, letting any verifier validate
+	// this token's signature with nothing beyond the token itself (docs/
+	// design.md §25: this was a real gap — there was no other way to
+	// discover this key at all). Build with JWKFromPublicKey.
+	JWK map[string]any
+	// X5C, if non-empty, is embedded in the JWS header (RFC 7515
+	// §4.1.6) — the signing key's certificate chain, leaf first, each
+	// entry base64-STANDARD-encoded DER (matching
+	// internal/clientassertion's x5c convention on the issuer side).
+	// Lets a verifier additionally *evaluate trust* in the signer (chain
+	// it to a real trust list), not just validate the signature — the
+	// same distinction docs/design.md §20 draws for client assertions.
+	// JWK and X5C are independent, unlike a client assertion's proof of
+	// possession (which requires exactly one): a status list signer's
+	// own key is not a secret proving identity the way an issuer's
+	// assertion key is, so both may be present, either alone, or (if
+	// this deployment's signing key has no associated certificate)
+	// neither — a verifier that can't discover the key any other way
+	// can then only decode the list's contents without a trust
+	// decision, this service's original, more limited behavior.
+	X5C []string
+}
+
+// JWKFromPublicKey renders pub as a bare JWK map — kty/crv/x/y only, no
+// kid/alg/use (those belong at the JWS header's own top level, or don't
+// apply to an embedded signing key the way they would to a discovery
+// document) — matching the shape this repo's own client-assertion
+// examples already use for a bare `jwk` header (status.siros.org's
+// in-browser generator, internal/clientassertion's tests).
+func JWKFromPublicKey(pub *ecdsa.PublicKey) (map[string]any, error) {
+	raw, err := (&jose.JSONWebKey{Key: pub}).MarshalJSON()
+	if err != nil {
+		return nil, fmt.Errorf("statuslist: marshal jwk: %w", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, fmt.Errorf("statuslist: unmarshal jwk: %w", err)
+	}
+	return m, nil
 }
 
 // BuildToken signs a Status List Token (JWT form, `typ: statuslist+jwt`
 // per §5.1) over the given bitmap.
-func BuildToken(key *ecdsa.PrivateKey, p TokenParams) (string, error) {
+func BuildToken(key crypto.Signer, p TokenParams) (string, error) {
 	lst, err := EncodeLst(p.Bitmap.Bytes())
 	if err != nil {
 		return "", err
@@ -101,10 +144,22 @@ func BuildToken(key *ecdsa.PrivateKey, p TokenParams) (string, error) {
 		},
 	}
 
-	tok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	// es256CryptoSignerMethod, not jwt.SigningMethodES256: this signs
+	// through crypto.Signer (see signer.go's doc comment), which both an
+	// in-memory *ecdsa.PrivateKey and a PKCS#11-backed signer (§26)
+	// implement identically — jwt.SigningMethodES256 only accepts a
+	// concrete *ecdsa.PrivateKey. The wire format is unchanged either
+	// way, so verification (ParseToken, any real verifier) is unaffected.
+	tok := jwt.NewWithClaims(es256CryptoSignerMethod{}, claims)
 	tok.Header["typ"] = "statuslist+jwt"
 	if p.KeyID != "" {
 		tok.Header["kid"] = p.KeyID
+	}
+	if p.JWK != nil {
+		tok.Header["jwk"] = p.JWK
+	}
+	if len(p.X5C) > 0 {
+		tok.Header["x5c"] = p.X5C
 	}
 
 	signed, err := tok.SignedString(key)
