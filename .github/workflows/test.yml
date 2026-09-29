@@ -9,6 +9,8 @@ jobs:
     - uses: actions/setup-go@v6
       with:
          go-version-file: go.mod
+    - name: install SoftHSM2 (for the PKCS#11 signing integration test, docs/design.md §26)
+      run: sudo apt-get update && sudo apt-get install -y softhsm2 opensc
     - name: run tests
       run: make test
     - name: generate test coverage

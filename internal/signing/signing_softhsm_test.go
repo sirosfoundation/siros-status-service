@@ -158,6 +158,16 @@ func TestNewSigner_PKCS11_SignsAndVerifiesRealStatusListToken(t *testing.T) {
 	}
 }
 
+func TestNewSigner_PKCS11_UnknownKeyLabelErrors(t *testing.T) {
+	pkcs11Cfg := softHSMConfig(t)
+	pkcs11Cfg.KeyLabel = "no-such-key-on-this-token"
+
+	_, _, err := NewSigner(config.SigningSource{PKCS11: &pkcs11Cfg})
+	if err == nil {
+		t.Fatal("expected an error for a key label that doesn't exist on the token")
+	}
+}
+
 func TestNewSigner_InMemoryKeyBypassesPKCS11(t *testing.T) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
