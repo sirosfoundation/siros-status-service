@@ -36,9 +36,13 @@ import (
 
 // Published is a cached, signed token plus the version it was built
 // from, so the API layer can serve conditional GETs without re-signing
-// on every request.
+// on every request. Both wire formats (docs/design.md §27) are built and
+// cached together from the same bitmap snapshot — building CWT
+// alongside JWT is one extra cheap sign+CBOR-encode per rebuild, not
+// worth the complexity of a separate per-format lazy cache.
 type Published struct {
 	Token   string
+	CWT     []byte
 	Version int64
 	Bits    int
 	TTL     int64
@@ -168,18 +172,26 @@ func (p *Publisher) PublishIfStale(ctx context.Context, lm *store.ListMeta, ttlS
 		return nil, fmt.Errorf("publisher: wrap snapshot for %s: %w", lm.ID, err)
 	}
 
-	token, err := statuslist.BuildToken(p.key, statuslist.TokenParams{
+	tokenParams := statuslist.TokenParams{
 		ListURL:  p.baseURL + "/lists/" + lm.ID,
 		IssuedAt: time.Now(),
 		TTL:      ttlSeconds,
 		Bitmap:   bm,
 		KeyID:    p.keyID,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("publisher: build token for %s: %w", lm.ID, err)
+		JWK:      p.jwk,
+		X5C:      p.certChain,
 	}
 
-	pub := &Published{Token: token, Version: liveVersion, Bits: lm.Bits, TTL: ttlSeconds}
+	token, err := statuslist.BuildToken(p.key, tokenParams)
+	if err != nil {
+		return nil, fmt.Errorf("publisher: build JWT token for %s: %w", lm.ID, err)
+	}
+	cwt, err := statuslist.BuildCWTToken(p.key, tokenParams)
+	if err != nil {
+		return nil, fmt.Errorf("publisher: build CWT token for %s: %w", lm.ID, err)
+	}
+
+	pub := &Published{Token: token, CWT: cwt, Version: liveVersion, Bits: lm.Bits, TTL: ttlSeconds}
 	p.mu.Lock()
 	p.cache[lm.ID] = pub
 	p.mu.Unlock()

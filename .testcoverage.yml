@@ -9,16 +9,16 @@ exclude:
     - ^tools/gen-fixture/                 # one-off dev tooling, not unit-testable
     - ^tools/loadtest/                    # drives a real deployment over HTTP, not unit-testable
     - ^tools/gen-config-docs/             # code-generation script, not unit-testable
-    - ^internal/ingestion/                # HTTP handlers wiring store+pool+publisher — needs live infra
-    - ^internal/verifier/                 # same reason
+    - ^internal/ingestion/                # HTTP handlers wiring store+pool+publisher — needs live infra;
+                                           # internal/verifier (the read-only counterpart) is NOT excluded
+                                           # here anymore — it's now covered by real Postgres+Redis-backed
+                                           # HTTP tests (internal/testsupport, docs/design.md §27's
+                                           # content-negotiation tests), measured at >70% honestly.
     - ^internal/as/(server|handlers)\.go$ # AS's HTTP surface — needs live Postgres+HTTP; shard.go
                                            # (issuer-shard assignment/reassignment, §23) is NOT excluded
                                            # here — it's now covered by internal/testsupport-backed
                                            # integration tests (real Postgres via testcontainers-go).
     - ^internal/pgutil/                   # advisory-locked DDL helper — needs live Postgres
-    - ^internal/publisher/publisher\.go$   # orchestrates store + signing — needs live infra, same reason.
-                                           # debounce.go (the leadingDebouncer coalescing logic, §9) is
-                                           # pure and fully unit-tested, so it's NOT excluded here.
     - ^internal/config/                   # thin env-var loader, low value to unit test in isolation
     - ^internal/metrics/                  # promauto declarations + thin wrappers around live
                                            # pgxpool.Stat/redis.PoolStats — genuinely low value to unit
@@ -69,3 +69,13 @@ override:
     path: ^tools/reassign-shard$
   - threshold: 60
     path: ^tools/reassign-shard/main\.go$
+  # internal/publisher.New/PublishIfStale are now exercised by real
+  # integration tests (internal/publisher/publisher_test.go's
+  # construction-time validation, and internal/verifier's real
+  # Postgres+Redis-backed HTTP tests); MarkDirty/Get/Run are still only
+  # reachable from a live running service (background debounce/backstop
+  # loops, docs/design.md §9) — actual measured coverage ~50%/60%.
+  - threshold: 45
+    path: ^internal/publisher/publisher\.go$
+  - threshold: 55
+    path: ^internal/publisher$

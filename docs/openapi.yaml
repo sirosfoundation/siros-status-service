@@ -321,7 +321,9 @@ paths:
         No authentication. Returns a signed Status List Token; decompress
         and bit-unpack its `status_list` claim to read any index, not
         just one you ask for by name. Standard HTTP caching applies —
-        poll as often as you like.
+        poll as often as you like. Content negotiation (§27) picks JWT or
+        CWT via `Accept`; JWT is the default when `Accept` is absent,
+        empty, or `*/*`.
       tags: [Verifier]
       security: []
       servers:
@@ -335,6 +337,13 @@ paths:
           in: path
           required: true
           schema: { type: string }
+        - name: Accept
+          in: header
+          required: false
+          schema: { type: string, enum: ["application/statuslist+jwt", "application/statuslist+cwt"] }
+          description: >-
+            Requests the JWT or CWT representation (§27). Omitted, empty,
+            or `*/*` gets JWT; any other value gets 406.
         - name: If-None-Match
           in: header
           required: false
@@ -360,10 +369,27 @@ paths:
                   `x5c` chain (§4.1.6, leaf first), a bare `jwk`
                   (§4.1.3), both, or (a signing key with no associated
                   certificate) neither — do not assume which.
+            application/statuslist+cwt:
+              schema:
+                type: string
+                format: binary
+                description: >-
+                  Signed Status List Token (CWT, COSE_Sign1_Tagged).
+                  Same claims as the JWT form, CBOR-encoded per
+                  draft-ietf-oauth-status-list-21 §4.3/§5.2. The COSE
+                  protected header carries `x5chain` (RFC 9360) if this
+                  deployment's signing key has an associated certificate
+                  chain — there is no CWT equivalent of the JWT form's
+                  bare `jwk` (§27).
         "304":
           description: Not modified (If-None-Match matched)
         "404":
           description: No such list
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "406":
+          description: Accept named a representation other than JWT or CWT
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

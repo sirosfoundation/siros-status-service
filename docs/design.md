@@ -1425,3 +1425,79 @@ real StatusListToken end to end through it, including confirming a
 second, freshly-opened pool against the same token produces signatures
 verifiable against the same public key (proving the key is durable on
 the token, not an artifact of one in-process pool).
+
+## 27. CWT (CBOR/COSE) Status List Tokens, alongside JWT via content negotiation
+
+**The gap:** draft-ietf-oauth-status-list-21 defines two independent
+wire formats for the same Status List Token — JWT (§4.1/§5.1, what this
+service had exclusively implemented) and CBOR/COSE (§4.3/§5.2). A
+verifier built around CBOR tooling (common on the credential side: mdoc,
+COSE-based wallets) had no way to consume this service's output at all
+without first translating JWT itself.
+
+**Decided:** `internal/statuslist/cwt.go` adds `BuildCWTToken`/
+`ParseCWTToken` as a second, independent encoding of the same bitmap —
+not a re-wrap of the JWT logic, since the claim shapes, header labels,
+and signing pre-image genuinely differ:
+
+- **Claims**: the top-level claim set uses integer keys per RFC 8392/
+  §5.2 (`sub`→2, `iat`→6, `ttl`→65534, `status_list`→65533), but the
+  nested `status_list` map itself keeps **text** keys (`bits`, `lst`,
+  `aggregation_uri`) — confirmed directly against the draft's own text,
+  not assumed by analogy with the outer claims. `lst` is a raw CBOR byte
+  string, never base64-encoded (unlike the JWT form) — `compressLst`/
+  `decompressLst` were split out of `EncodeLst`/`DecodeLst` as the
+  shared DEFLATE/zlib step both wire formats compress with (§4.1's
+  compression is identical either way; only the base64url layer on top
+  is JWT-only).
+- **Token structure**: COSE_Sign1_Tagged (CBOR tag 18, RFC 9052 §4.2),
+  encoded with Core Deterministic CBOR (canonical map key ordering,
+  shortest-form integers) so two implementations building the same
+  claims produce byte-identical output, matching COSE's own recommended
+  encoding discipline.
+- **Signing**: reuses `asn1ToRawECDSA` (signer.go) completely unchanged
+  — ES256's ASN.1-DER-to-raw-r‖s conversion is identical in COSE and
+  JOSE, confirming the §26 `crypto.Signer` abstraction really was
+  wire-format-agnostic, not JWT-specific. Only the pre-image differs:
+  COSE's `Sig_structure` (`["Signature1", protected_header, external_aad,
+  payload]`, CBOR-encoded then SHA-256'd) instead of JWS's dot-joined
+  base64url header/payload.
+- **Key discovery, deliberately narrower than JWT's**: only `x5chain`
+  (RFC 9360, COSE header label 33) is supported — the direct COSE
+  analog of `x5c`. COSE has no standard header for a bare embedded
+  verification key (no equivalent of JOSE's `jwk` header exists in the
+  COSE registry), so `TokenParams.JWK` is silently ignored when building
+  a CWT; a deployment with no certificate chain for its signing key
+  publishes a CWT with no key-discovery header at all — a real,
+  spec-driven scope decision, not an oversight.
+
+**Publisher**: `Published` gained a `CWT []byte` field alongside
+`Token`; `PublishIfStale` builds both representations from the same
+bitmap snapshot on every rebuild — one extra sign+CBOR-encode per
+publish is cheap enough that a separate per-format lazy cache wasn't
+worth the added complexity. (Building this surfaced a real, separate,
+pre-existing bug: `p.jwk`/`p.certChain`, derived at Publisher
+construction for §25, were never actually being passed into `BuildToken`'s
+`TokenParams` — every previously-published JWT had been missing its own
+`jwk`/`x5c` headers since §25 shipped. Fixed in the same change; no
+targeted test had caught it because `TestBuildToken_JWKHeader` tested
+`BuildToken` directly, never `PublishIfStale`'s call site.)
+
+**Verifier**: `handleGetList` negotiates format from `Accept`
+(`negotiateListFormat`, handlers.go) — omitted, empty, or `*/*` gets JWT
+(preserving every existing client's behavior unchanged), an explicit
+`application/statuslist+cwt` gets CWT, and anything else gets `406`.
+Deliberately simple string matching, not full RFC 7231 §5.3.2
+q-value-weighted negotiation — the only two values that will ever appear
+on either side of this don't need it. `ETag`/`Cache-Control` are
+unaffected either way (the ETag is the Redis bitmap version, not tied to
+encoding).
+
+**Verified**: `internal/statuslist/cwt_test.go` round-trips a real CWT
+through `BuildCWTToken`/`ParseCWTToken` and independently decodes the raw
+CBOR to confirm tag 18, `alg: -7`, `typ`, and `x5chain` are exactly what
+the spec requires — not just that this package's own encode/decode
+agree with each other. `internal/verifier/handlers_test.go` exercises
+the full negotiation matrix (default, explicit JWT, explicit CWT,
+wildcard, 406, ETag across both formats) over real HTTP against a real
+Postgres+Redis-backed `Server`.

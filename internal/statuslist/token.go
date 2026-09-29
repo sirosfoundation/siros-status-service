@@ -15,30 +15,27 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// EncodeLst compresses a packed bitmap with DEFLATE/zlib
+// compressLst DEFLATE/zlib-compresses a packed bitmap
 // (draft-ietf-oauth-status-list-21 §4.1: "DEFLATE [RFC1951] with the
-// ZLIB [RFC1950] data format") and base64url-encodes it with padding
-// omitted (§4.2), producing the `lst` claim value.
-func EncodeLst(raw []byte) (string, error) {
+// ZLIB [RFC1950] data format") — the shared compression step behind both
+// representations of the `lst` value: base64url text for JWT (§4.2,
+// EncodeLst) and a raw CBOR byte string for CWT (§4.3, unchanged
+// compression, just no base64 layer on top — BuildCWTToken calls this
+// directly).
+func compressLst(raw []byte) ([]byte, error) {
 	var buf bytes.Buffer
 	w := zlib.NewWriter(&buf)
 	if _, err := w.Write(raw); err != nil {
-		return "", fmt.Errorf("statuslist: compress: %w", err)
+		return nil, fmt.Errorf("statuslist: compress: %w", err)
 	}
 	if err := w.Close(); err != nil {
-		return "", fmt.Errorf("statuslist: compress: %w", err)
+		return nil, fmt.Errorf("statuslist: compress: %w", err)
 	}
-	return base64.RawURLEncoding.EncodeToString(buf.Bytes()), nil
+	return buf.Bytes(), nil
 }
 
-// DecodeLst reverses EncodeLst. It exists primarily for round-trip
-// testing and for a future verifier-side implementation; the issuer
-// service itself never needs to decode a list it just built.
-func DecodeLst(lst string) ([]byte, error) {
-	compressed, err := base64.RawURLEncoding.DecodeString(lst)
-	if err != nil {
-		return nil, fmt.Errorf("statuslist: base64url decode: %w", err)
-	}
+// decompressLst reverses compressLst.
+func decompressLst(compressed []byte) ([]byte, error) {
 	r, err := zlib.NewReader(bytes.NewReader(compressed))
 	if err != nil {
 		return nil, fmt.Errorf("statuslist: zlib reader: %w", err)
@@ -49,6 +46,27 @@ func DecodeLst(lst string) ([]byte, error) {
 		return nil, fmt.Errorf("statuslist: decompress: %w", err)
 	}
 	return raw, nil
+}
+
+// EncodeLst compresses a packed bitmap and base64url-encodes it with
+// padding omitted (§4.2), producing the JWT form's `lst` claim value.
+func EncodeLst(raw []byte) (string, error) {
+	compressed, err := compressLst(raw)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(compressed), nil
+}
+
+// DecodeLst reverses EncodeLst. It exists primarily for round-trip
+// testing and for a future verifier-side implementation; the issuer
+// service itself never needs to decode a list it just built.
+func DecodeLst(lst string) ([]byte, error) {
+	compressed, err := base64.RawURLEncoding.DecodeString(lst)
+	if err != nil {
+		return nil, fmt.Errorf("statuslist: base64url decode: %w", err)
+	}
+	return decompressLst(compressed)
 }
 
 // StatusListClaim is the `status_list` claim (§4.2).
