@@ -1426,6 +1426,40 @@ second, freshly-opened pool against the same token produces signatures
 verifiable against the same public key (proving the key is durable on
 the token, not an artifact of one in-process pool).
 
+**A real production blocker, found by actually deploying, not by any
+test above**: the very first live redeploy after this feature landed
+failed at `docker build` — `pkcs11pool` (via `github.com/miekg/pkcs11`)
+requires cgo to dlopen a vendor-provided PKCS#11 module, and this
+repo's `Dockerfile` builds a fully static `CGO_ENABLED=0` binary (a
+deliberate architectural choice: no libc/cgo runtime dependency at all
+for the default image). Every build/test/lint run up to that point had
+implicitly run with cgo enabled (the local dev machine's and GitHub
+Actions' own default), so this incompatibility was invisible until the
+actual Docker build — a real gap in "build ✓, vet ✓, test ✓, lint ✓"
+verification that never actually exercised the production build
+configuration.
+
+**Fixed with a build-tag split**, not by adding a C toolchain to the
+default image (which would make every deployment pay for cgo whether or
+not it uses an HSM): `internal/signing.NewSigner` now has two
+implementations behind Go's own build-tag mechanism —
+`signing_default.go` (`//go:build !pkcs11`, the default, what every
+existing deployment already builds) refuses PKCS#11 config with a clear,
+actionable error instead of linking the driver at all; `signing_pkcs11.go`
+(`//go:build pkcs11`) has the real `pkcs11pool`-backed implementation,
+requiring `CGO_ENABLED=1` and a C toolchain. A real HSM deployment builds
+its own separate image (`-tags pkcs11 CGO_ENABLED=1`), never the default
+one — this repo's own Fly test deployment (no HSM in this environment)
+needed no Dockerfile change at all once `internal/signing` was split.
+
+CI now guards both directions: an explicit
+`CGO_ENABLED=0 GOOS=linux go build ./...` step, matching the Dockerfile
+exactly, catches any future untagged-build regression immediately rather
+than only at actual deploy time; a separate `-tags pkcs11 CGO_ENABLED=1`
+build+test+lint pass (with SoftHSM2 installed) keeps proving the real
+HSM path still works, now genuinely isolated from the default build it
+was accidentally coupled to before.
+
 ## 27. CWT (CBOR/COSE) Status List Tokens, alongside JWT via content negotiation
 
 **The gap:** draft-ietf-oauth-status-list-21 defines two independent

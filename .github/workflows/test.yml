@@ -9,8 +9,8 @@ jobs:
     - uses: actions/setup-go@v6
       with:
          go-version-file: go.mod
-    - name: install SoftHSM2 (for the PKCS#11 signing integration test, docs/design.md §26)
-      run: sudo apt-get update && sudo apt-get install -y softhsm2 opensc
+    - name: verify the static production build (CGO_ENABLED=0, matches Dockerfile — docs/design.md §26)
+      run: CGO_ENABLED=0 GOOS=linux GOWORK=off go build ./...
     - name: run tests
       run: make test
     - name: generate test coverage
@@ -30,6 +30,12 @@ jobs:
           echo "::error::docs/CONFIGURATION.md is out of date. Run 'make gen-config-docs' and commit the result."
           exit 1
         fi
+    - name: install SoftHSM2 (for the -tags pkcs11 build's real HSM integration test, docs/design.md §26)
+      run: sudo apt-get update && sudo apt-get install -y softhsm2 opensc
+    - name: verify the -tags pkcs11 build (CGO_ENABLED=1, a real HSM deployment's own separate build)
+      run: CGO_ENABLED=1 GOWORK=off go build -tags pkcs11 ./...
+    - name: run -tags pkcs11 tests (internal/signing only — the rest of the repo doesn't change under this tag)
+      run: CGO_ENABLED=1 GOWORK=off go test -tags pkcs11 -race ./internal/signing/...
 
   lint:
     runs-on: ubuntu-latest
@@ -42,3 +48,8 @@ jobs:
       uses: golangci/golangci-lint-action@v9
       with:
         version: v2.12.2
+    - name: golangci-lint (-tags pkcs11)
+      uses: golangci/golangci-lint-action@v9
+      with:
+        version: v2.12.2
+        args: --build-tags=pkcs11
