@@ -10,11 +10,15 @@ on:
       - 'rust/**'
       - 'tools/gen-fixture/**'
       - '.github/workflows/rust.yml'
+      - 'rust-toolchain.toml'
+      - '.github/actions/rust-toolchain/**'
   pull_request:
     paths:
       - 'rust/**'
       - 'tools/gen-fixture/**'
       - '.github/workflows/rust.yml'
+      - 'rust-toolchain.toml'
+      - '.github/actions/rust-toolchain/**'
 
 permissions:
   contents: read
