@@ -29,7 +29,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOWORK=off go build \
     -ldflags="-s -w -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME}" \
     -o /out/ingress-router ./cmd/ingress-router
 
-FROM alpine:3.23
+FROM alpine:3.24
 
 RUN apk add --no-cache ca-certificates && \
     adduser -D -u 1000 statuslist
