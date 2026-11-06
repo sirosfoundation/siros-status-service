@@ -101,7 +101,7 @@ rust-test: ## Run the rust/ workspace's tests (docs/design.md §16 — Fastly Co
 	cd rust && cargo test --locked -p token-format
 
 .PHONY: rust-build-wasm
-rust-build-wasm: ## Build rust/'s crates for wasm32-wasip1 (Fastly Compute's target); needs `rustup target add wasm32-wasip1`
+rust-build-wasm: ## Build rust/'s crates for wasm32-wasip1 (Fastly Compute's target); rust-toolchain.toml installs the wasm32-wasip1 target
 	cd rust && cargo build --locked -p token-format --target wasm32-wasip1
 	cd rust && cargo build --locked -p fastly-ingress-sample --target wasm32-wasip1 --release
 
