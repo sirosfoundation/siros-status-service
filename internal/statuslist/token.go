@@ -98,7 +98,8 @@ type TokenParams struct {
 	TTL int64
 	// Bitmap is the current, live status bitmap to publish.
 	Bitmap *Bitmap
-	// KeyID is placed in the JWS header (kid) if non-empty.
+	// KeyID is placed in the JWS header (kid) if non-empty, and also on
+	// the embedded JWK (if any) so the two match.
 	KeyID string
 	// JWK, if non-nil, is embedded in the JWS header (RFC 7515 §4.1.3) —
 	// the signing key's own public half, letting any verifier validate
@@ -125,11 +126,9 @@ type TokenParams struct {
 }
 
 // JWKFromPublicKey renders pub as a bare JWK map — kty/crv/x/y only, no
-// kid/alg/use (those belong at the JWS header's own top level, or don't
-// apply to an embedded signing key the way they would to a discovery
-// document) — matching the shape this repo's own client-assertion
-// examples already use for a bare `jwk` header (status.siros.org's
-// in-browser generator, internal/clientassertion's tests).
+// kid/alg/use. BuildToken adds the kid (from TokenParams.KeyID) to its
+// copy of the embedded JWK so it matches the JWS header kid, as
+// verifiers such as the OIDF conformance suite require.
 func JWKFromPublicKey(pub *ecdsa.PublicKey) (map[string]any, error) {
 	raw, err := (&jose.JSONWebKey{Key: pub}).MarshalJSON()
 	if err != nil {
@@ -174,7 +173,19 @@ func BuildToken(key crypto.Signer, p TokenParams) (string, error) {
 		tok.Header["kid"] = p.KeyID
 	}
 	if p.JWK != nil {
-		tok.Header["jwk"] = p.JWK
+		// RFC 7515 §4.1.4 allows any JWK parameter here. When the JWS
+		// header carries a kid, also set it on the embedded JWK:
+		// verifiers that match the header kid against the embedded key
+		// (e.g. the OIDF conformance suite) otherwise reject a bare JWK.
+		// Copy so the caller's (shared) map is never mutated.
+		jwk := make(map[string]any, len(p.JWK)+1)
+		for k, v := range p.JWK {
+			jwk[k] = v
+		}
+		if p.KeyID != "" {
+			jwk["kid"] = p.KeyID
+		}
+		tok.Header["jwk"] = jwk
 	}
 	if len(p.X5C) > 0 {
 		tok.Header["x5c"] = p.X5C

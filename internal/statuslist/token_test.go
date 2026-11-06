@@ -251,6 +251,46 @@ func TestBuildToken_JWKHeader(t *testing.T) {
 	}
 }
 
+func TestBuildToken_JWKHeaderCarriesKid(t *testing.T) {
+	key := testSigningKey(t)
+	jwk, err := JWKFromPublicKey(&key.PublicKey)
+	if err != nil {
+		t.Fatalf("JWKFromPublicKey: %v", err)
+	}
+	bm, err := NewBitmap(10, 1)
+	if err != nil {
+		t.Fatalf("NewBitmap: %v", err)
+	}
+	build := func(kid string) map[string]any {
+		token, err := BuildToken(key, TokenParams{
+			ListURL: "https://status.example.org/lists/abc", IssuedAt: time.Now(),
+			Bitmap: bm, KeyID: kid, JWK: jwk,
+		})
+		if err != nil {
+			t.Fatalf("BuildToken: %v", err)
+		}
+		return decodeTokenHeader(t, token)
+	}
+
+	h := build("prototype-1")
+	gotJWK, _ := h["jwk"].(map[string]any)
+	if h["kid"] != "prototype-1" || gotJWK["kid"] != "prototype-1" {
+		t.Errorf("header kid = %v, jwk kid = %v; want both prototype-1", h["kid"], gotJWK["kid"])
+	}
+	if _, mutated := jwk["kid"]; mutated {
+		t.Error("BuildToken mutated the caller's JWK map")
+	}
+
+	h = build("")
+	gotJWK, _ = h["jwk"].(map[string]any)
+	if _, ok := h["kid"]; ok {
+		t.Error("unexpected header kid")
+	}
+	if _, ok := gotJWK["kid"]; ok {
+		t.Error("jwk should have no kid when no KeyID is set")
+	}
+}
+
 func TestBuildToken_X5CHeader(t *testing.T) {
 	key := testSigningKey(t)
 	chain := []string{"leaf-cert-der-base64", "intermediate-cert-der-base64"}
