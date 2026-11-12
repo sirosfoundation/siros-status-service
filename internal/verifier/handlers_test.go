@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-jose/go-jose/v4"
 	rediscli "github.com/redis/go-redis/v9"
@@ -244,5 +245,37 @@ func TestHandleGetListJWKS_UnknownListReturns404(t *testing.T) {
 	srv.Router().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/lists/no-such-list/.well-known/jwks.json", nil))
 	if w.Code != 404 {
 		t.Errorf("status = %d, want 404; body: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestArchivedList_KeysFollowTheListsOwnAvailability: an archived list
+// keeps serving its token and its keys through the retention window,
+// and both answer 410 once the window has elapsed.
+func TestArchivedList_KeysFollowTheListsOwnAvailability(t *testing.T) {
+	srv, listID, _ := newTestServer(t)
+	if err := srv.meta.Freeze(t.Context(), listID); err != nil {
+		t.Fatalf("Freeze: %v", err)
+	}
+	if err := srv.meta.Archive(t.Context(), listID); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	paths := []string{"/lists/" + listID, "/lists/" + listID + "/.well-known/jwks.json"}
+
+	srv.cfg.GCRetentionPeriod = time.Hour
+	for _, path := range paths {
+		w := httptest.NewRecorder()
+		srv.Router().ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != 200 {
+			t.Errorf("within retention: GET %s = %d, want 200; body: %s", path, w.Code, w.Body.String())
+		}
+	}
+
+	srv.cfg.GCRetentionPeriod = 0
+	for _, path := range paths {
+		w := httptest.NewRecorder()
+		srv.Router().ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != 410 {
+			t.Errorf("past retention: GET %s = %d, want 410; body: %s", path, w.Code, w.Body.String())
+		}
 	}
 }
