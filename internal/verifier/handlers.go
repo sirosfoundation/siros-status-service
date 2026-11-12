@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/sirosfoundation/siros-status-service/internal/store"
 )
 
 // jwtMediaType and cwtMediaType are the two Status List Token wire
@@ -47,30 +49,10 @@ func negotiateListFormat(accept string) string {
 // from the (shared) Postgres row and lets internal/publisher (already
 // shard-aware — see its package doc) pick the right shard's Redis.
 func (s *Server) handleGetList(c *gin.Context) {
-	listID := c.Param("listID")
 	ctx := c.Request.Context()
-
-	lm, err := s.meta.GetList(ctx, listID)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "lookup failed"})
-		return
-	}
+	lm := s.lookupServableList(c)
 	if lm == nil {
-		c.JSON(404, gin.H{"error": "list not found"})
 		return
-	}
-	if lm.State == "ARCHIVED" {
-		// Keep serving the last-published token for a retention window
-		// after archival (so a verifier that checks late doesn't hit a
-		// dead link out of nowhere), then 410 Gone once that window has
-		// elapsed. Within the window this falls through to the same
-		// publish path below — harmless, since an archived list accepts
-		// no further writes (internal/ingestion enforces this), so
-		// PublishIfStale is just a cache hit after its first rebuild.
-		if lm.ArchivedAt == nil || time.Since(*lm.ArchivedAt) > s.cfg.GCRetentionPeriod {
-			c.JSON(410, gin.H{"error": "this status list has been archived"})
-			return
-		}
 	}
 
 	format := negotiateListFormat(c.GetHeader("Accept"))
@@ -98,4 +80,57 @@ func (s *Server) handleGetList(c *gin.Context) {
 		return
 	}
 	c.Data(200, jwtMediaType, []byte(pub.Token))
+}
+
+// jwksCacheSeconds is how long a relying party may cache a list's JWK
+// Set. The signing key is static for the life of a deployment (key
+// rotation is a redeploy), so this only bounds how quickly a rotated
+// key becomes visible.
+const jwksCacheSeconds = 300
+
+// handleGetListJWKS serves the StatusListToken signing key as a JWK Set
+// under the list's own URI (docs/design.md §28). A relying party's
+// trust evaluator that binds a signer by discovering keys from the
+// entity it is asked about — for a status list that entity is the
+// token's `sub`, the list URI — fetches this document and matches the
+// key that signed the token against it. The key is the same for every
+// list this deployment serves; the document is still served per list,
+// with the same 404/410 answers as the list itself, because the list
+// URI is the identifier the trust decision is keyed on.
+func (s *Server) handleGetListJWKS(c *gin.Context) {
+	if s.lookupServableList(c) == nil {
+		return
+	}
+	c.Header("Cache-Control", "public, max-age="+strconv.Itoa(jwksCacheSeconds))
+	c.JSON(200, s.pub.JWKS())
+}
+
+// lookupServableList resolves the request's :listID to a list this
+// service still serves. It returns nil after writing the response
+// itself when the list is unknown (404), archived past its retention
+// window (410, §7 point 4, §13), or the lookup failed (500).
+func (s *Server) lookupServableList(c *gin.Context) *store.ListMeta {
+	lm, err := s.meta.GetList(c.Request.Context(), c.Param("listID"))
+	if err != nil {
+		c.JSON(500, gin.H{"error": "lookup failed"})
+		return nil
+	}
+	if lm == nil {
+		c.JSON(404, gin.H{"error": "list not found"})
+		return nil
+	}
+	if lm.State == "ARCHIVED" {
+		// Keep serving the last-published token for a retention window
+		// after archival (so a verifier that checks late doesn't hit a
+		// dead link out of nowhere), then 410 Gone once that window has
+		// elapsed. Within the window handleGetList falls through to its
+		// usual publish path — harmless, since an archived list accepts
+		// no further writes (internal/ingestion enforces this), so
+		// PublishIfStale is just a cache hit after its first rebuild.
+		if lm.ArchivedAt == nil || time.Since(*lm.ArchivedAt) > s.cfg.GCRetentionPeriod {
+			c.JSON(410, gin.H{"error": "this status list has been archived"})
+			return nil
+		}
+	}
+	return lm
 }

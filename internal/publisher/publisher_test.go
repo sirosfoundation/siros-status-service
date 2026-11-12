@@ -74,3 +74,63 @@ func TestNew_RejectsNonECDSAKey(t *testing.T) {
 		t.Fatal("expected an error for a non-ECDSA signing key")
 	}
 }
+
+// TestJWKS_CarriesTheSigningKeyAndTokenKid: the JWK Set served under a
+// list URI (docs/design.md §28) holds the signing key's public half
+// with the kid tokens are signed under, and each call returns its own
+// copy.
+func TestJWKS_CarriesTheSigningKeyAndTokenKid(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	p, err := New(nil, nil, key, "test-key-1", "https://status.example.org", nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	set := p.JWKS()
+	keys, ok := set["keys"].([]any)
+	if !ok || len(keys) != 1 {
+		t.Fatalf("keys = %v, want a one-element array", set["keys"])
+	}
+	jwk := keys[0].(map[string]any)
+	wantJWK, err := statuslist.JWKFromPublicKey(&key.PublicKey)
+	if err != nil {
+		t.Fatalf("JWKFromPublicKey: %v", err)
+	}
+	for _, member := range []string{"kty", "crv", "x", "y"} {
+		if jwk[member] != wantJWK[member] {
+			t.Errorf("jwk[%q] = %v, want %v", member, jwk[member], wantJWK[member])
+		}
+	}
+	if jwk["kid"] != "test-key-1" || jwk["use"] != "sig" || jwk["alg"] != "ES256" {
+		t.Errorf("kid/use/alg = %v/%v/%v, want test-key-1/sig/ES256", jwk["kid"], jwk["use"], jwk["alg"])
+	}
+
+	jwk["x"] = "tampered"
+	again := p.JWKS()["keys"].([]any)[0].(map[string]any)
+	if again["x"] != wantJWK["x"] {
+		t.Error("mutating a returned JWK Set changed the publisher's key")
+	}
+	if _, leaked := p.jwk["kid"]; leaked {
+		t.Error("JWKS() wrote kid into the publisher's shared jwk map")
+	}
+}
+
+// TestJWKS_OmitsKidWhenNoKeyIDConfigured mirrors BuildToken, which
+// signs without a kid header when no key id is configured.
+func TestJWKS_OmitsKidWhenNoKeyIDConfigured(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	p, err := New(nil, nil, key, "", "https://status.example.org", nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	jwk := p.JWKS()["keys"].([]any)[0].(map[string]any)
+	if _, has := jwk["kid"]; has {
+		t.Errorf("kid = %v, want it absent", jwk["kid"])
+	}
+}

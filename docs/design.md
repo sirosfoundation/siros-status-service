@@ -1535,3 +1535,51 @@ agree with each other. `internal/verifier/handlers_test.go` exercises
 the full negotiation matrix (default, explicit JWT, explicit CWT,
 wildcard, 406, ETag across both formats) over real HTTP against a real
 Postgres+Redis-backed `Server`.
+
+## 28. Signing keys discoverable under the list URI: `GET /lists/{id}/.well-known/jwks.json`
+
+**The gap:** §25 lets a verifier check a token's signature from the
+token alone. A trust evaluator needs more: an independent source for
+the signer's keys. go-trust's whitelist registry binds a presented key
+by matching its fingerprint against keys it discovers from the entity
+it is asked about, and for a status list that entity is the token's
+`sub` — the list URI (Token Status List §5.1/§8.3; siros-verifier-core
+queries with `action: status-list-signer` and the list URI as subject).
+With no key document under `BASE_URL/lists/{id}`, such an evaluator has
+nothing to match against and denies. The same gap was reported against
+the vc registry in [SUNET/vc#922](https://github.com/SUNET/vc/issues/922).
+
+**Decided:** `verifier-service` serves
+
+```
+GET /lists/{id}/.well-known/jwks.json
+→ {"keys":[{"kty":"EC","crv":"P-256","x":"…","y":"…","kid":"<SIGNING_KEY_ID>","use":"sig","alg":"ES256"}]}
+```
+
+- **Path.** `{list URI}/.well-known/jwks.json` is the location go-trust
+  falls back to after its four metadata lookups, and the simplest shape
+  any other evaluator can be pointed at.
+- **Content.** `Publisher.JWKS()` renders the same public key and `kid`
+  every token's `jwk` header carries, so the discovered key's
+  fingerprint equals the signing key's.
+- **Per list, one key.** Every list a deployment serves is signed by the
+  same key, and the document is still served per list — the list URI is
+  the identifier the trust decision is keyed on. The endpoint answers
+  `404` for an unknown list and `410` for one archived past its
+  retention window, the same as `GET /lists/{id}` (both share
+  `lookupServableList`).
+- **Caching.** `Cache-Control: public, max-age=300`; the key is static
+  for the life of a deployment.
+
+**Left open:** this service's list ids are random and its pool rotates
+(§7/§8), so a relying party cannot enumerate list URIs in a whitelist
+ahead of time. An evaluator that discovers keys only for exactly-listed
+entities needs a way to bind keys for a URI prefix
+(`BASE_URL/lists/*`), or to validate the token's `x5c` chain for an
+`https` subject. That is a change on the evaluator side, tracked in
+[go-trust#256](https://github.com/sirosfoundation/go-trust/issues/256).
+
+**Verified:** `internal/verifier/handlers_test.go` fetches the JWK Set
+and the list's token over real HTTP and confirms the token verifies
+under the discovered key and that the two `kid`s match; an unknown list
+returns `404`.

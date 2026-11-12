@@ -19,6 +19,11 @@
 #       # ^ StatusListToken signing key — must be the SAME value set on
 #       #   siros-status-service-verifier's and -ingestion-fra's
 #       #   SIGNING_KEY_PEM secret (one signing identity, all shards).
+#
+# Optional secret (docs/design.md §25): SIGNING_CERT_CHAIN_PEM, the PEM
+# certificate chain (leaf first) for SIGNING_KEY_PEM's key, carried in
+# every token's x5c header — the same value on -verifier and
+# -ingestion-fra. See fly.verifier.toml.
 
 app = "siros-status-service-ingestion-iad"
 primary_region = "iad"

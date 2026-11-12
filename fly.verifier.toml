@@ -34,6 +34,14 @@
 #       #   instance can serve (all of them: a verifier can't know in
 #       #   advance which shard a requested list_id belongs to). Add an
 #       #   entry per shard as more regions are introduced.
+#
+# Optional secret, for deployments whose relying parties expect a
+# certificate-bound status list signer (docs/design.md §25):
+#   fly secrets set -a siros-status-service-verifier \
+#     SIGNING_CERT_CHAIN_PEM="$(cat chain.pem)"
+#       # ^ PEM bundle, leaf first, for SIGNING_KEY_PEM's key — carried
+#       #   in every token's x5c header. Same value on every
+#       #   -ingestion-<region>.
 
 app = "siros-status-service-verifier"
 primary_region = "iad"

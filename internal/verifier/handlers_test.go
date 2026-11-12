@@ -4,10 +4,15 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/go-jose/go-jose/v4"
 	rediscli "github.com/redis/go-redis/v9"
 
 	"github.com/sirosfoundation/siros-status-service/internal/allocator"
@@ -173,5 +178,104 @@ func TestHandleGetList_ETagStillWorksAcrossFormats(t *testing.T) {
 	srv.Router().ServeHTTP(w2, req2)
 	if w2.Code != 304 {
 		t.Fatalf("status = %d, want 304 for a matching If-None-Match", w2.Code)
+	}
+}
+
+// TestHandleGetListJWKS_KeyVerifiesTheListsOwnToken is the property the
+// endpoint exists for (docs/design.md §28): the key discovered under
+// the list URI is the key that signed the token served at that URI, and
+// it carries the same kid as the token's JWS header.
+func TestHandleGetListJWKS_KeyVerifiesTheListsOwnToken(t *testing.T) {
+	srv, listID, _ := newTestServer(t)
+	router := srv.Router()
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/lists/"+listID+"/.well-known/jwks.json", nil))
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if cc := w.Header().Get("Cache-Control"); cc != "public, max-age=300" {
+		t.Errorf("Cache-Control = %q, want %q", cc, "public, max-age=300")
+	}
+	var set jose.JSONWebKeySet
+	if err := json.Unmarshal(w.Body.Bytes(), &set); err != nil {
+		t.Fatalf("body is not a JWK Set: %v; body: %s", err, w.Body.String())
+	}
+	if len(set.Keys) != 1 {
+		t.Fatalf("JWK Set has %d keys, want 1", len(set.Keys))
+	}
+	jwk := set.Keys[0]
+	if jwk.KeyID != "test-key" || jwk.Use != "sig" || jwk.Algorithm != "ES256" {
+		t.Errorf("kid/use/alg = %q/%q/%q, want test-key/sig/ES256", jwk.KeyID, jwk.Use, jwk.Algorithm)
+	}
+	discovered, ok := jwk.Key.(*ecdsa.PublicKey)
+	if !ok {
+		t.Fatalf("discovered key is %T, want *ecdsa.PublicKey", jwk.Key)
+	}
+
+	tw := httptest.NewRecorder()
+	router.ServeHTTP(tw, httptest.NewRequest(http.MethodGet, "/lists/"+listID, nil))
+	if tw.Code != 200 {
+		t.Fatalf("list status = %d, want 200", tw.Code)
+	}
+	if _, err := statuslist.ParseToken(tw.Body.String(), discovered); err != nil {
+		t.Errorf("the list's token does not verify under the key discovered at its own URI: %v", err)
+	}
+	header, err := base64.RawURLEncoding.DecodeString(strings.SplitN(tw.Body.String(), ".", 2)[0])
+	if err != nil {
+		t.Fatalf("decode token header: %v", err)
+	}
+	var hdr struct {
+		Kid string `json:"kid"`
+	}
+	if err := json.Unmarshal(header, &hdr); err != nil {
+		t.Fatalf("parse token header: %v", err)
+	}
+	if hdr.Kid != jwk.KeyID {
+		t.Errorf("token header kid = %q, discovered key kid = %q; they must match", hdr.Kid, jwk.KeyID)
+	}
+}
+
+// TestHandleGetListJWKS_UnknownListReturns404: keys are published for
+// lists this service serves, with the same answer as the list itself.
+func TestHandleGetListJWKS_UnknownListReturns404(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/lists/no-such-list/.well-known/jwks.json", nil))
+	if w.Code != 404 {
+		t.Errorf("status = %d, want 404; body: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestArchivedList_KeysFollowTheListsOwnAvailability: an archived list
+// keeps serving its token and its keys through the retention window,
+// and both answer 410 once the window has elapsed.
+func TestArchivedList_KeysFollowTheListsOwnAvailability(t *testing.T) {
+	srv, listID, _ := newTestServer(t)
+	if err := srv.meta.Freeze(t.Context(), listID); err != nil {
+		t.Fatalf("Freeze: %v", err)
+	}
+	if err := srv.meta.Archive(t.Context(), listID); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	paths := []string{"/lists/" + listID, "/lists/" + listID + "/.well-known/jwks.json"}
+
+	srv.cfg.GCRetentionPeriod = time.Hour
+	for _, path := range paths {
+		w := httptest.NewRecorder()
+		srv.Router().ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != 200 {
+			t.Errorf("within retention: GET %s = %d, want 200; body: %s", path, w.Code, w.Body.String())
+		}
+	}
+
+	srv.cfg.GCRetentionPeriod = 0
+	for _, path := range paths {
+		w := httptest.NewRecorder()
+		srv.Router().ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != 410 {
+			t.Errorf("past retention: GET %s = %d, want 410; body: %s", path, w.Code, w.Body.String())
+		}
 	}
 }

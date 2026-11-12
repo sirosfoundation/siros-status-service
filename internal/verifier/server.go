@@ -1,5 +1,6 @@
 // Package verifier is the read-only, unauthenticated half of the split
-// described in docs/design.md §15.1: GET /lists/{id} only. It never
+// described in docs/design.md §15.1: GET /lists/{id} and the signing
+// keys discoverable under it (§28). It never
 // handles issuer writes — that's internal/ingestion, a separate service
 // (and, per shard, a separate process) entirely.
 package verifier
@@ -29,6 +30,7 @@ func (s *Server) Router() *gin.Engine {
 
 	r.GET("/healthz", s.handleHealthz)
 	r.GET("/lists/:listID", s.handleGetList)
+	r.GET("/lists/:listID/.well-known/jwks.json", s.handleGetListJWKS)
 	r.GET("/metrics", gin.WrapH(metrics.Handler()))
 
 	return r

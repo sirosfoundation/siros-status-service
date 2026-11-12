@@ -101,6 +101,25 @@ func New(bitmapsByShard map[string]*store.BitmapStore, meta *store.MetaStore, ke
 	}, nil
 }
 
+// JWKS returns the signing key's public half as a JWK Set (RFC 7517 §5)
+// — the same key every token's `jwk` header carries, with the same
+// `kid`, so a relying party that discovers keys from a URL rather than
+// from the token itself (docs/design.md §28) finds a key whose
+// fingerprint matches the one that signed the token. The returned value
+// is a fresh copy on every call.
+func (p *Publisher) JWKS() map[string]any {
+	jwk := make(map[string]any, len(p.jwk)+3)
+	for k, v := range p.jwk {
+		jwk[k] = v
+	}
+	if p.keyID != "" {
+		jwk["kid"] = p.keyID
+	}
+	jwk["use"] = "sig"
+	jwk["alg"] = "ES256"
+	return map[string]any{"keys": []any{jwk}}
+}
+
 // MarkDirty schedules a publish for listID shortly after a status write
 // succeeds — see the package doc for how the debounce/coalescing works.
 // ttlSeconds is the same value that will be embedded in the token, so

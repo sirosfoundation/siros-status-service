@@ -46,7 +46,9 @@ Four services (docs/design.md §15), each its own binary under `cmd/`:
   and rejects a token whose `tenant_id` (shard) doesn't match this
   instance's own as defense in depth.
 - **`cmd/verifier-service`** (`internal/verifier`) — read-only,
-  unauthenticated: `GET /lists/{id}`. A single instance can serve any
+  unauthenticated: `GET /lists/{id}`, plus the StatusListToken signing
+  key as a JWK Set at `GET /lists/{id}/.well-known/jwks.json` (design
+  doc §28). A single instance can serve any
   shard's lists — it looks up `shard_id` from the shared Postgres row
   and holds one Redis client per shard (`SHARD_REDIS_URLS`).
 - **`cmd/ingress-router`** (`internal/ingress`) — sits in front of the
@@ -164,6 +166,7 @@ curl -X PATCH "localhost:8094/status/<id>/<n>" -H "Authorization: Bearer $ACCESS
   -H "Content-Type: application/json" -d '{"status":"INVALID"}'
 
 curl localhost:8093/lists/<id>   # verifier-service, no auth — the signed StatusListToken (JWT)
+curl localhost:8093/lists/<id>/.well-known/jwks.json   # the key that signed it, as a JWK Set
 ```
 
 ## Configuration (environment variables)
@@ -189,6 +192,7 @@ Common to every binary: `HTTP_ADDR`, `BASE_URL`, `DATABASE_URL`.
 | `SHARD_ID` | `default` | which shard this instance owns |
 | `REDIS_ADDR` / `REDIS_URL` | `localhost:6379` / unset | this shard's Redis |
 | `SIGNING_KEY_PEM` | *(required)* | StatusListToken key — must match `verifier-service`'s |
+| `SIGNING_CERT_CHAIN_PEM` | unset | PEM bundle, leaf first: the signing key's certificate chain, carried in every token's `x5c` header (`x5chain` in CWT) next to the embedded `jwk` (§25). Must match `verifier-service`'s |
 | `AS_JWKS_URL` | *(required)* | e.g. `http://as:8090/.well-known/jwks.json` |
 | `ACCESS_TOKEN_ISSUER` | *(required)* | must equal the AS's `BASE_URL` |
 | `ACCESS_TOKEN_AUDIENCE` | `siros-status-service` | |
@@ -212,6 +216,7 @@ Common to every binary: `HTTP_ADDR`, `BASE_URL`, `DATABASE_URL`.
 |---|---|---|
 | `SHARD_REDIS_URLS` | *(required)* | JSON object, `shard_id -> redis URL`, one entry per shard this instance can serve |
 | `SIGNING_KEY_PEM` | *(required)* | must match `ingestion-service`'s |
+| `SIGNING_CERT_CHAIN_PEM` | unset | must match `ingestion-service`'s — set it wherever relying parties expect a certificate-bound status list signer (§25) |
 | `DEFAULT_TTL_SECONDS` | `3600` | |
 | `GC_RETENTION_PERIOD` | `720h` | must match ingestion's — governs the archived-list 410 cutoff |
 
