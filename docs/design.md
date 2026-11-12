@@ -1577,7 +1577,7 @@ ahead of time. An evaluator that discovers keys only for exactly-listed
 entities needs a way to bind keys for a URI prefix
 (`BASE_URL/lists/*`), or to validate the token's `x5c` chain for an
 `https` subject. That is a change on the evaluator side, tracked in
-go-trust.
+[go-trust#256](https://github.com/sirosfoundation/go-trust/issues/256).
 
 **Verified:** `internal/verifier/handlers_test.go` fetches the JWK Set
 and the list's token over real HTTP and confirms the token verifies
