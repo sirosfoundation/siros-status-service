@@ -399,6 +399,57 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /lists/{listID}/.well-known/jwks.json:
+    get:
+      operationId: getListJWKS
+      summary: The key that signs a status list, as a JWK Set
+      description: >-
+        No authentication. Returns the Status List Token signing key
+        under the list's own URL (docs/design.md §28), with the same
+        `kid` as the token's JWS header. A trust evaluator that binds a
+        signer by discovering keys from the entity it evaluates — for a
+        status list, the token's `sub`, this list's URL — matches the
+        token's signing key against this document. Every list a
+        deployment serves is signed by the same key.
+      tags: [Verifier]
+      security: []
+      servers:
+        - url: "{scheme}://{host}"
+          description: Verifier
+          variables:
+            scheme: { default: "https" }
+            host: { default: "lists.example.org" }
+      parameters:
+        - name: listID
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          headers:
+            Cache-Control: { schema: { type: string } }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys:
+                    type: array
+                    items:
+                      type: object
+                      description: "RFC 7517 JSON Web Key (EC P-256, use=sig, alg=ES256)"
+        "404":
+          description: No such list
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "410":
+          description: This list was archived and has passed its retention window.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
 components:
   securitySchemes:
     bearerAuth:
